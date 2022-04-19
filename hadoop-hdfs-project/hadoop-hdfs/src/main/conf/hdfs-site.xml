@@ -19,7 +19,7 @@
 <configuration>
     <property>
         <name>dfs.datanode.data.dir</name>
-        <value>/volumes/disk1/hadoop/data/</value>
+        <value>/home/vagrant/hadoop/data/</value>
     </property>
     <property>
         <name>serverless.http.timeout</name> <!-- Timeout is in seconds here. -->
@@ -84,7 +84,8 @@
     </property>
     <property>
         <name>serverless.endpoint</name>
-        <value>https://34.75.77.177:444/api/v1/web/whisk.system/default/namenode</value>
+        <!-- <value>https://34.75.77.177:444/api/v1/web/whisk.system/default/namenode</value> -->
+        <value>http://172.18.0.1:3233/api/v1/web/whisk.system/default/namenode</value>
         <!-- This is the IBM Cloud endpoint. -->
         <!--  <value>https://openwhisk.serverless-mds-cluster-243065a7719552ad2f4388dc81e46642-0000.us-east.containers.appdomain.cloud:443/api/v1/web/whisk.system/default/namenode</value>-->
     </property>
@@ -94,11 +95,11 @@
     </property>
     <property>
         <name>dfs.storage.driver.configfile</name>
-        <value>/home/ubuntu/repos/hops/hadoop-dist/target/hadoop-3.2.0.3-SNAPSHOT/etc/hadoop/ndb-config.properties</value>
+        <value>/home/vagrant/hops/hadoop-dist/target/hadoop-3.2.0.3-SNAPSHOT/etc/hadoop/ndb-config.properties</value>
     </property>
     <property>
         <name>dfs.storage.driver.jarFile</name>
-        <value>/home/ubuntu/repos/hops/hops-metadata-dal-impl-ndb/target/hops-metadata-dal-impl-ndb-3.2.0.3-SNAPSHOT.jar</value>
+        <value>/home/vagrant/hops/hops-metadata-dal-impl-ndb/target/hops-metadata-dal-impl-ndb-3.2.0.3-SNAPSHOT.jar</value>
     </property>
     <property>
         <name>dfs.storage.driver.class</name>

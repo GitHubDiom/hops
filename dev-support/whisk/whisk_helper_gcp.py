@@ -56,7 +56,7 @@ if __name__ == "__main__":
         dest = "main_class", type = str, default = "org.apache.hadoop.hdfs.serverless.OpenWhiskHandler",
         help = "The fully-qualified class name containing the OpenWhisk function handler.")
 
-    parser.add_argument("-j", "--path", dest = "jar_path", type = str, default = "/home/ubuntu/repos/hops/hadoop-hdfs-project/hadoop-hdfs/target/hadoop-hdfs-3.2.0.3-SNAPSHOT.jar",
+    parser.add_argument("-j", "--path", dest = "jar_path", type = str, default = "/home/vagrant/hops/hadoop-hdfs-project/hadoop-hdfs/target/hadoop-hdfs-3.2.0.3-SNAPSHOT.jar",
         help = "Path to the JAR file containing the ServerlessNameNode code.")
 
     #parser.add_argument("-t", "--tag", dest = "tag", type = str, default = "latest", help = "Docker image tag. Defaults to 'latest'")

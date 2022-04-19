@@ -19,7 +19,7 @@
 <configuration>
     <property>
         <name>fs.default.name</name >
-        <value></value> <!-- Put the IP address of the root HDFS FS here! -->
+        <value>hdfs://127.0.0.1:9000</value> <!-- Put the IP address of the root HDFS FS here! -->
     </property>
     <property>
         <name>hadoop.security.authentication</name>
