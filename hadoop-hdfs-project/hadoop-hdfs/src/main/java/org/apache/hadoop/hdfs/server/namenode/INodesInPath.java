@@ -179,6 +179,8 @@ public class INodesInPath {
     int inodeNum = 0;
     INode[] inodes = new INode[components.length];
 
+    LOG.debug("Current INode: " + curNode);
+
     while (count < components.length && curNode != null) {
       final boolean lastComp = (count == components.length - 1);
       inodes[inodeNum++] = curNode;
@@ -201,7 +203,15 @@ public class INodesInPath {
       }
       final byte[] childName = components[count + 1];
 
+      String parentName = curNode.getLocalName();
+      LOG.debug("Trying to find child '" + DFSUtil.bytes2String(childName) + "' of current INode '" + parentName + "'");
+
       curNode = dir.getChildINode(childName);
+
+      if (curNode == null)
+        LOG.warn("Failed to find child '" + DFSUtil.bytes2String(childName) + "' of current INode '" + parentName + "'");
+      else
+        LOG.debug("Successfully located child INode '" + curNode.getLocalName() + "' of parent '" + parentName + "'");
 
       count++;
     }

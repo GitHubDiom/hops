@@ -48,7 +48,7 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
   /**
    * Endpoint to use when local mode is enabled.
    */
-  public static final String SERVERLESS_ENDPOINT_LOCAL = "serverless.endpoint.local";
+  public static final String SERVERLESS_ENDPOINT_LOCAL = "serverless.localmode.endpoint";
   public static final String SERVERLESS_ENDPOINT_LOCAL_DEFAULT = "http://localhost:8080/run";
 
   /**
@@ -95,6 +95,12 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
 
   public static final String SERVERLESS_TX_EVENTS_ENABLED = "serverless.tx.events.enabled";
   public static final boolean SERVERLESS_TX_EVENTS_ENABLED_DEFAULT = true;
+
+  /**
+   * The amount of time (in milliseconds) that must elapse before we manually trigger a GC.
+   */
+  public static final String SERVERLESS_IDLE_GC_THRESHOLD = "serverless.idle.gc.threshold";
+  public static final long SERVERLESS_IDLE_GC_THRESHOLD_DEFAULT = 500;
 
   /**
    * If true, then we'll pass an argument to the NNs indicating that they should print their

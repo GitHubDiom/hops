@@ -21,6 +21,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Set;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -94,10 +95,41 @@ public class ExecutionManager {
      */
     private final boolean txEventsEnabled;
 
+    /**
+     * Records the timestamp of the last time we executed a task. We use this to determine
+     * if we should trigger a garbage collection ourselves (i.e., while we're idle).
+     */
+    private AtomicLong lastTaskExecutedTimestamp = new AtomicLong(0L);
+
+    /**
+     * Used to reset the value of {@code gcTriggeredDuringThisIdleInterval}. Specifically, if this value is not
+     * equal to {@code lastTaskExecutedTimestamp}, then we're in a different idle interval (since we've executed a
+     * task since the last time we checked). Thus, we set {@code gcTriggeredDuringThisIdleInterval} to false.
+     */
+    private long lastTaskExecutedTimestampCopy = 0L;
+
+    /**
+     * The amount of time (in milliseconds) that must elapse before we manually trigger a GC.
+     */
+    private final long idleGcThreshold;
+
+    /**
+     * We only need/want to trigger a GC once during an idle interval.
+     * This flag indicates whether we've triggered one or not during an idle interval.
+     */
+    private volatile boolean gcTriggeredDuringThisIdleInterval = false;
+
+    /**
+     * We only want to perform NDB updates roughly every heartbeat interval. The update thread wakes up more
+     * often than that to check for System.GC() calls, though. So, we use this to avoid checking NDB too often.
+     */
+    private long lastNdbUpdateTimestamp = 0L;
+
     public ExecutionManager(Configuration conf, ServerlessNameNode serverlessNameNode) {
         LOG.debug("Creating ExecutionManager now.");
 
         this.txEventsEnabled = conf.getBoolean(SERVERLESS_TX_EVENTS_ENABLED, SERVERLESS_TX_EVENTS_ENABLED_DEFAULT);
+        this.idleGcThreshold = conf.getLong(SERVERLESS_IDLE_GC_THRESHOLD, SERVERLESS_IDLE_GC_THRESHOLD_DEFAULT);
 
 //        int resultRetainIntervalMilliseconds = conf.getInt(SERVERLESS_RESULT_CACHE_INTERVAL_MILLISECONDS, SERVERLESS_RESULT_CACHE_INTERVAL_MILLISECONDS_DEFAULT);
 //        int previousResultCacheMaxSize = conf.getInt(SERVERLESS_RESULT_CACHE_MAXIMUM_SIZE, SERVERLESS_RESULT_CACHE_MAXIMUM_SIZE_DEFAULT);
@@ -127,15 +159,56 @@ public class ExecutionManager {
         this.writeAcknowledgementsToDeleteLock = new ReentrantReadWriteLock();
 
         ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
-        executor.scheduleAtFixedRate(() -> {
+        executor.scheduleAtFixedRate(this::updateThread, 0, idleGcThreshold, TimeUnit.MILLISECONDS);
+        //}, 0, serverlessNameNode.getHeartBeatInterval(), TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Called by the 'update thread'. Performs work such as fetching storage reports from NDB, clearing
+     * ACKs from consistency protocol operations, and checking if we should manually trigger a GC.
+     */
+    private void updateThread() {
+        if (System.currentTimeMillis() - lastNdbUpdateTimestamp > serverlessNameNodeInstance.getHeartBeatInterval()) {
             tryUpdateFromIntermediateStorage();
 
-            try {
-                removeWriteAcknowledgements();
-            } catch (StorageException ex) {
-                LOG.error("StorageException encountered while trying to delete old WriteAcknowledgement instances:", ex);
+            // COMMENTED OUT: We use ZooKeeper for ACKs now, so we don't need to bother checking with NDB.
+//            try {
+//                removeWriteAcknowledgements();
+//            } catch (StorageException ex) {
+//                LOG.error("StorageException encountered while trying to delete old WriteAcknowledgement instances:", ex);
+//            }
+
+            lastNdbUpdateTimestamp = System.currentTimeMillis();
+        }
+
+        // We're going to check if we've been idle for long enough to want to trigger a GC.
+        long lastTaskExecutedTs = lastTaskExecutedTimestamp.get();
+
+        // If `lastTaskExecutedTimestampCopy` is not equal to lastTaskExecutedTimestamp, then we're in a different
+        // idle interval than we were before (since we've executed a task since the last time we checked). Thus, we
+        // set gcTriggeredDuringThisIdleInterval to false.
+        if (lastTaskExecutedTs != lastTaskExecutedTimestampCopy) {
+            // If debug logging is enabled, then we might print a message about resetting the value of the
+            // `gcTriggeredDuringThisIdleInterval` flag. We only print a message if the flag is currently set
+            // to true, and thus we're actually changing its value by setting it to false. If it is already
+            // set to false, then we do not need to print a message.
+            if (LOG.isDebugEnabled()) {
+                if (gcTriggeredDuringThisIdleInterval)
+                    LOG.debug("Resetting the value of 'gcTriggeredDuringThisIdleInterval'.");
             }
-        }, 0, serverlessNameNode.getHeartBeatInterval(), TimeUnit.MILLISECONDS);
+
+            gcTriggeredDuringThisIdleInterval = false;
+        }
+
+        // Have we been idle long enough to warrant a GC? If so, then trigger one,
+        // assuming we haven't already triggered a GC in this same idle interval.
+        if (System.currentTimeMillis() - lastTaskExecutedTs > idleGcThreshold && !gcTriggeredDuringThisIdleInterval) {
+            LOG.debug("Manually triggering garbage collection!");
+            System.gc();
+            gcTriggeredDuringThisIdleInterval = true;
+        }
+
+        lastTaskExecutedTimestampCopy = lastTaskExecutedTs;
     }
 
     /**
@@ -418,6 +491,7 @@ public class ExecutionManager {
         //currentlyExecutingTasks.asMap().remove(taskId);
         completedTasks.add(taskId);
         currentlyExecutingTasks.remove(taskId);
+        lastTaskExecutedTimestamp.set(System.currentTimeMillis()); // Update the time at which we last executed a task.
     }
 
 //    /**

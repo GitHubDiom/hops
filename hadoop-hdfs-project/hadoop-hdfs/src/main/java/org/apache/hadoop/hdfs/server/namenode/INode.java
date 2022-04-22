@@ -695,6 +695,25 @@ public abstract class INode implements Comparable<byte[]>, LinkedElement, Serial
     return StringUtils.split(path, Path.SEPARATOR_CHAR);
   }
 
+  /**
+   * Split absolute path into array of components. Mimicking the function of {@link INode#getPathComponents}, we
+   * return an array of length one containing null if the path components come back empty (e.g., if the value of the
+   * {@code path} argument is "/").
+   *
+   * @param path The absolute path to split and return components.
+   *
+   * @return Components of the given path in a String array.
+   */
+  public static String[] getComponentsAsStringArray(String path) {
+    if (path == null || !path.startsWith(Path.SEPARATOR)) {
+      throw new AssertionError("Absolute path required");
+    }
+    String[] components = StringUtils.split(path, Path.SEPARATOR_CHAR);
+    if (components.length == 0)
+      components = new String[] {null};
+    return components;
+  }
+
   public static int getNumPathComponents(String path) {
     if (path == null || !path.startsWith(Path.SEPARATOR)) {
       throw new AssertionError("Absolute path required");
@@ -785,6 +804,8 @@ public abstract class INode implements Comparable<byte[]>, LinkedElement, Serial
 
   private static final byte[] EMPTY_BYTES = {};
 
+  private static final String EMPTY_STRING = "";
+
   @Override
   public final int compareTo(byte[] bytes) {
     final byte[] name = getLocalNameBytes();
@@ -794,7 +815,9 @@ public abstract class INode implements Comparable<byte[]>, LinkedElement, Serial
   }
 
   public final int compareTo(String otherName) {
-    final String name = getLocalName();
+    String name = getLocalName();
+    if (name == null) name = EMPTY_STRING;
+    if (otherName == null) otherName = EMPTY_STRING;
     return name.compareTo(otherName);
   }
 
@@ -841,10 +864,6 @@ public abstract class INode implements Comparable<byte[]>, LinkedElement, Serial
 
   public String nameParentKey() {
     return nameParentKey(parentId, getLocalName());
-  }
-
-  public static int nameParentKeyHash(long parentId, String name) {
-    return (int)(parentId ^ name.hashCode());
   }
   
   /**

@@ -136,7 +136,32 @@ public class INodeContext extends BaseEntityContext<Long, INode> {
     }
   }
 
-  private void updateCache(INode node) throws TransactionContextException, StorageException {
+  /**
+   * Add an INode to the cache, if it is non-null. If the INode parameter is null, this just returns.
+   *
+   * @param node The INode to add to the cache.
+   * @param localName The local name of the INode. Only used for debugging purposes (i.e., when INode is null).
+   * @param parentId The INode ID of the given INode. Only used for debugging purposes (i.e., when INode is null).
+   */
+  private void updateCache(INode node, String localName, long parentId) throws TransactionContextException, StorageException {
+    if (node == null) {
+      LOG.warn("Attempting to update cache with null value for INode '" + localName + "', parentID=" + parentId + ".");
+      return;
+    }
+
+    InMemoryINodeCache metadataCache = getMetadataCache();
+    if (metadataCache == null) return;
+
+    metadataCache.put(node.getFullPathName(), node.getId(), node);
+  }
+
+  /**
+   * Add an INode to the cache, if it is non-null. If the INode parameter is null, this just returns.
+   *
+   * @param node The INode to add to the cache.
+   * @param inodeId The ID of the INode. Only used for debugging purposes (i.e., when INode is null).
+   */
+  private void updateCache(INode node, long inodeId) throws TransactionContextException, StorageException {
     if (node == null) {
       LOG.warn("Attempting to update cache with null INode.");
       return;
@@ -401,28 +426,37 @@ public class INodeContext extends BaseEntityContext<Long, INode> {
     // First, check the local, in-memory metadata cache.
     result = checkCache(inodeId);
     if (result != null) {
+      if (LOG.isTraceEnabled()) LOG.trace("Successfully retrieved INode '" + result.getLocalName() + "' (ID=" +
+              inodeId + ") from local metadata cache.");
       return result;
     }
 
     if (contains(inodeId)) {
       result = get(inodeId);
       if(result!=null) {
+        if (LOG.isTraceEnabled()) LOG.trace("Successfully retrieved INode '" + result.getLocalName() + "' (ID=" +
+                inodeId + ") from transaction context.");
+
         hit(inodeFinder, result, "id", inodeId, "name", result.getLocalName(), "parent_id", result.getParentId(),
             "partition_id", result.getPartitionId());
-      }else{
+      } else{
+        if (LOG.isTraceEnabled()) LOG.trace("INode ID=" +
+                inodeId + " was in transaction context as null...");
         hit(inodeFinder, result, "id", inodeId);
       }
     } else {
-      if (LOG.isDebugEnabled()) LOG.debug("Retrieving INode ID=" + inodeId + " from intermediate storage.");
+      if (LOG.isTraceEnabled()) LOG.trace("Retrieving INode ID=" + inodeId + " from intermediate storage.");
       aboutToAccessStorage(inodeFinder, params);
       result = dataAccess.findInodeByIdFTIS(inodeId);
       gotFromDB(inodeId, result);
       if (result != null) {
+        if (LOG.isTraceEnabled()) LOG.trace("Successfully retrieved INode ID=" + inodeId + " from intermediate storage.");
         inodesNameParentIndex.put(result.nameParentKey(), result);
         miss(inodeFinder, result, "id", inodeId, "name", result.getLocalName(), "parent_id", result.getParentId(),
           "partition_id", result.getPartitionId());
-        updateCache(result);
+        updateCache(result, inodeId);
       } else {
+        if (LOG.isTraceEnabled()) LOG.trace("Failed to retrieve INode ID=" + inodeId + " from intermediate storage.");
         miss(inodeFinder, result, "id");
       }
     }
@@ -465,9 +499,9 @@ public class INodeContext extends BaseEntityContext<Long, INode> {
         gotFromDBWithPossibleInodeId(result, possibleInodeId);
         inodesNameParentIndex.put(nameParentKey, result);
         missUpgrade(inodeFinder, result, "name", name, "parent_id", parentId, "partition_id", partitionId);
-        updateCache(result);
+        updateCache(result, name, parentId);
       } else {
-        // if (LOG.isDebugEnabled()) LOG.debug("Successfully retrieved INode '" + name + "', parentID=" + parentId + " from INode Hint Cache.");
+        if (LOG.isTraceEnabled()) LOG.trace("Successfully retrieved INode '" + name + "', parentID=" + parentId + " from INode Hint Cache.");
         hit(inodeFinder, result, "name", name, "parent_id", parentId, "partition_id", partitionId);
       }
     } else {
@@ -486,7 +520,7 @@ public class INodeContext extends BaseEntityContext<Long, INode> {
         inodesNameParentIndex.put(nameParentKey, result);
         miss(inodeFinder, result, "name", name, "parent_id", parentId, "partition_id", partitionId,
             "possible_inode_id",possibleInodeId);
-        updateCache(result);
+        updateCache(result, name, parentId);
       }
     }
     return result;
