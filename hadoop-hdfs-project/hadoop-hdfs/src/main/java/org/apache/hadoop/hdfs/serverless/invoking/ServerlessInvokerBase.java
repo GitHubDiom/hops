@@ -240,8 +240,8 @@ public abstract class ServerlessInvokerBase<T> {
             LOG.debug("===========================");
 
             LOG.debug("HTTP Response from function:\n" + httpResponse);
-            LOG.debug("HTTP Response Entity: " + httpResponse.getEntity());
-            LOG.debug("HTTP Response Entity Content: " + json);
+//            LOG.debug("HTTP Response Entity: " + httpResponse.getEntity());
+//            LOG.debug("HTTP Response Entity Content: " + json);
         }
 
         JsonObject jsonObjectResponse = null;
@@ -655,9 +655,6 @@ public abstract class ServerlessInvokerBase<T> {
             String src = functionMapping.getAsJsonPrimitive(ServerlessNameNodeKeys.FILE_OR_DIR).getAsString();
             long parentINodeId = functionMapping.getAsJsonPrimitive(ServerlessNameNodeKeys.PARENT_ID).getAsLong();
             int function = functionMapping.getAsJsonPrimitive(ServerlessNameNodeKeys.FUNCTION).getAsInt();
-
-            if (LOG.isDebugEnabled())
-
 
             cache.addEntry(src, function, false);
         }

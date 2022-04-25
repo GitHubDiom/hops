@@ -5,6 +5,7 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.hdfs.serverless.ServerlessNameNodeKeys;
 import org.apache.hadoop.hdfs.serverless.operation.execution.FileSystemTask;
+import org.apache.hadoop.hdfs.serverless.operation.execution.NameNodeResult;
 import org.apache.hadoop.hdfs.serverless.operation.execution.NullResult;
 
 import java.util.concurrent.*;
@@ -15,7 +16,7 @@ import java.util.concurrent.*;
  *
  * These are used on the client side.
  */
-public class RequestResponseFuture implements Future<JsonObject> {
+public class RequestResponseFuture implements Future<Object> {
     private static final Log LOG = LogFactory.getLog(FileSystemTask.class);
 
     private enum State {WAITING, DONE, CANCELLED, ERROR}
@@ -90,7 +91,7 @@ public class RequestResponseFuture implements Future<JsonObject> {
     }
 
     @Override
-    public JsonObject get() throws InterruptedException, ExecutionException {
+    public Object get() throws InterruptedException, ExecutionException {
         if (LOG.isDebugEnabled()) LOG.debug("Waiting for result for TCP request " + requestId + " now...");
         final Object resultOrNull = this.resultQueue.take();
         if (LOG.isDebugEnabled()) LOG.debug("Got result for TCP future " + requestId + ".");
@@ -98,15 +99,15 @@ public class RequestResponseFuture implements Future<JsonObject> {
         // Check if the NullResult object was placed in the queue, in which case we should return null.
         if (resultOrNull instanceof NullResult)
             return null;
-        else if (resultOrNull instanceof JsonObject)
-            return (JsonObject)resultOrNull;
+        else if (resultOrNull instanceof JsonObject || resultOrNull instanceof NameNodeResult)
+            return resultOrNull;
         else
             throw new IllegalArgumentException("Received invalid object type as response for request " + requestId
                     + ". Object type: " + resultOrNull.getClass().getSimpleName());
     }
 
     @Override
-    public JsonObject get(long timeout, TimeUnit unit)
+    public Object get(long timeout, TimeUnit unit)
             throws InterruptedException, ExecutionException, TimeoutException {
         final Object resultOrNull = this.resultQueue.poll(timeout, unit);
         if (resultOrNull == null) {
@@ -115,8 +116,8 @@ public class RequestResponseFuture implements Future<JsonObject> {
 
         if (resultOrNull instanceof NullResult)
             return null;
-        else if (resultOrNull instanceof JsonObject)
-            return (JsonObject)resultOrNull;
+        else if (resultOrNull instanceof JsonObject || resultOrNull instanceof NameNodeResult)
+            return resultOrNull;
         else
             throw new IllegalArgumentException("Received invalid object type as response for request " + requestId
                     + ". Object type: " + resultOrNull.getClass().getSimpleName());
@@ -129,7 +130,7 @@ public class RequestResponseFuture implements Future<JsonObject> {
      *
      * @return True if we were able to insert the result into the queue, otherwise false.
      */
-    public boolean postResultImmediate(JsonObject result) {
+    public boolean postResultImmediate(Object result) {
         try {
             boolean success = resultQueue.offer(result);
 

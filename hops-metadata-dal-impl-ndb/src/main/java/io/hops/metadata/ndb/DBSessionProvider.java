@@ -76,18 +76,27 @@ public class DBSessionProvider implements Runnable {
     LOG.info("Database name: " + conf.get(Constants.PROPERTY_CLUSTER_DATABASE));
     LOG.info("Max Transactions: " + conf.get(Constants.PROPERTY_CLUSTER_MAX_TRANSACTIONS));
 
-    try {
+    int retries = 1;
 
-      if (sessionFactory != null) {
-        LOG.debug("HopsSessionFactory instance is already instantiated. Reusing existing object.");
-      } else {
-        LOG.debug("Instantiation HopsSessionFactory object now...");
-        sessionFactory = new HopsSessionFactory(ClusterJHelper.getSessionFactory(conf));
-        LOG.debug("Instantiation of HopsSessionFactory was successful!");
+    while (true) {
+      try {
+        if (sessionFactory != null) {
+          LOG.debug("HopsSessionFactory instance is already instantiated. Reusing existing object.");
+        } else {
+          LOG.debug("Instantiation HopsSessionFactory object now...");
+          sessionFactory = new HopsSessionFactory(ClusterJHelper.getSessionFactory(conf));
+          LOG.debug("Instantiation of HopsSessionFactory was successful!");
+          break;
+        }
+      } catch (ClusterJException ex) {
+        LOG.error("Exception encountered while instantiation HopsSessionFactory instance: ", ex);
+
+        retries -= 1;
+
+        // Only throw the exception if we aren't going to try again.
+        if (retries < 0)
+          throw HopsExceptionHelper.wrap(ex);
       }
-    } catch (ClusterJException ex) {
-      LOG.error("Exception encountered while instantiation HopsSessionFactory instance: ", ex);
-      throw HopsExceptionHelper.wrap(ex);
     }
 
     LOG.debug("Initializing " + initialPoolSize + " session(s) now...");

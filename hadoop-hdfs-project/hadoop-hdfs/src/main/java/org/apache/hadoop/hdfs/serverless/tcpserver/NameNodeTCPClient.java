@@ -1,15 +1,14 @@
 package org.apache.hadoop.hdfs.serverless.tcpserver;
 
+import com.esotericsoftware.kryo.Kryo;
+import com.esotericsoftware.kryo.io.Input;
+import com.esotericsoftware.kryo.io.Output;
 import com.esotericsoftware.kryonet.Client;
 import com.esotericsoftware.kryonet.Connection;
 import com.esotericsoftware.kryonet.FrameworkMessage;
 import com.esotericsoftware.kryonet.Listener;
 import com.esotericsoftware.kryonet.util.TcpIdleSender;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.ObjectWriter;
 import com.github.benmanes.caffeine.cache.*;
-import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.apache.commons.logging.Log;
@@ -20,12 +19,11 @@ import org.apache.hadoop.hdfs.server.namenode.ServerlessNameNode;
 import org.apache.hadoop.hdfs.serverless.BaseHandler;
 import org.apache.hadoop.hdfs.serverless.ServerlessNameNodeKeys;
 import org.apache.hadoop.hdfs.serverless.operation.ConsistencyProtocol;
-import org.apache.hadoop.hdfs.serverless.operation.execution.FileSystemTask;
 import org.apache.hadoop.hdfs.serverless.operation.execution.NameNodeResult;
 import org.apache.log4j.LogManager;
 
 import java.io.IOException;
-import java.io.Serializable;
+import java.io.ObjectOutputStream;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -294,6 +292,9 @@ public class NameNodeTCPClient {
             return false;
         }
 
+//        Kryo clientWriteKryo = new Kryo();
+//        ServerlessClientServerUtilities.registerClassesToBeTransferred(clientWriteKryo);
+
         tcpClient.addListener(new Listener.ThreadedListener(new Listener() {
             /**
              * This listener is responsible for handling messages received from HopsFS clients. These messages will
@@ -304,6 +305,7 @@ public class NameNodeTCPClient {
              * @param object The object that the client sent to us.
              */
             public void received(Connection connection, Object object) {
+                long receivedAtTime = System.currentTimeMillis();
                 NameNodeResult tcpResult;
                 // If we received a JsonObject, then add it to the queue for processing.
                 if (object instanceof String) {
@@ -314,7 +316,7 @@ public class NameNodeTCPClient {
 //                                        (Runtime.getRuntime().totalMemory() / 1000000.0) +  " MB, free space in heap: " +
 //                                        (Runtime.getRuntime().freeMemory() / 1000000.0) + " MB.");
                     JsonObject jsonObject = new JsonParser().parse((String)object).getAsJsonObject();
-                    tcpResult = handleWorkAssignment(jsonObject);
+                    tcpResult = handleWorkAssignment(jsonObject, receivedAtTime);
                 }
                 else if (object instanceof FrameworkMessage.KeepAlive) {
                     // The server periodically sends KeepAlive objects to prevent the client from disconnecting
@@ -328,7 +330,7 @@ public class NameNodeTCPClient {
                             "[TCP Client] Received object of unexpected type from client " + connection
                                     + ". Object type: " + object.getClass().getSimpleName() + ".");
                     tcpResult = new NameNodeResult(deploymentNumber, "N/A", "TCP",
-                            serverlessNameNode.getId());
+                            serverlessNameNode.getId(), "N/A");
                     tcpResult.addException(ex);
                 }
 
@@ -336,22 +338,36 @@ public class NameNodeTCPClient {
 //                String jsonString = new Gson().toJson(tcpResult.toJson(ServerlessClientServerUtilities.OPERATION_RESULT,
 //                        serverlessNameNode.getNamesystem().getMetadataCacheManager()));
 
-                ObjectWriter ow = new ObjectMapper().writer().withDefaultPrettyPrinter();
-                String jsonString = null;
-                try {
-                    jsonString = ow.writeValueAsString(tcpResult.toJsonJackson(
-                            ServerlessClientServerUtilities.OPERATION_RESULT,
-                            serverlessNameNode.getNamesystem().getMetadataCacheManager()));
-                } catch (JsonProcessingException e) {
-                    e.printStackTrace();
-                }
+//                ObjectWriter ow = new ObjectMapper().writer().withDefaultPrettyPrinter();
+//                String jsonString = null;
+//                try {
+//                    jsonString = ow.writeValueAsString(tcpResult.toJsonJackson(
+//                            ServerlessClientServerUtilities.OPERATION_RESULT,
+//                            serverlessNameNode.getNamesystem().getMetadataCacheManager()));
+//                } catch (JsonProcessingException e) {
+//                    e.printStackTrace();
+//                }
+//
+//                long t = System.currentTimeMillis();
+//
+//                if (t - s > 10)
+//                    LOG.warn("Converting NameNodeResult instance to JSON took " + (t - s) + " ms.");
 
-                long t = System.currentTimeMillis();
+//                Kryo kryo = tcpClient.getKryo();
+//
+//                LOG.debug("Trying to write the NameNodeResult object for debugging purposes now.");
+//                long start = System.currentTimeMillis();
+//                Output output = new Output(32768, -1);
+//                kryo.writeObject(output, tcpResult);
+//                long end = System.currentTimeMillis();
+//                LOG.debug("Wrote NameNodeResult object to Output in " + (end - start) + " ms.");
 
-                if (t - s > 10)
-                    LOG.warn("Converting NameNodeResult instance to JSON took " + (t - s) + " ms.");
+//                Input input = new Input(output.getBuffer(), 0, output.position());
+//                NameNodeResult tcpResult2 = kryo.readObject(input, NameNodeResult.class);
+//                LOG.debug("Read TCP result back in " + (System.currentTimeMillis() - end) +
+//                        " ms. TcpResult: " + tcpResult2);
 
-                trySendTcp(connection, jsonString, false);
+                trySendTcp(connection, tcpResult);
             }
 
             public void disconnected (Connection connection) {
@@ -434,25 +450,22 @@ public class NameNodeTCPClient {
      *
      * @param connection The connection over which we're sending an object.
      * @param payload The object to send.
-     * @param enqueuedResult Indicates whether we're trying to send a previously-enqueued result (i.e., a result
-     *                       that we tried to send but couldn't because the buffer was full). This is just for
-     *                       debugging purposes.
      */
-    private void trySendTcp(Connection connection, Object payload, boolean enqueuedResult) {
+    private void trySendTcp(Connection connection, NameNodeResult payload) {
         double currentCapacity = ((double) connection.getTcpWriteBufferSize()) / ((double) writeBufferSize);
         if (currentCapacity >= 0.9) {
             LOG.warn("[TCP Client] Write buffer for connection " + connection.getRemoteAddressTCP() +
                     " is at " + (currentCapacity * 100) + "% capacity! Enqueuing payload to send later...");
             connection.addListener(new TcpIdleSender() {
                 boolean _started = false;
-                Object enqueuedObject = payload;
+                NameNodeResult enqueuedObject = payload;
 
                 @Override
-                protected Object next() {
+                protected NameNodeResult next() {
                     if (LOG.isDebugEnabled())
                         LOG.debug("[TCP Client] Write buffer for connection " +  connection.getRemoteAddressTCP() +
                                 " has reached 'idle' capacity. Sending buffered object now.");
-                    Object toReturn = enqueuedObject;
+                    NameNodeResult toReturn = enqueuedObject;
 
                     // Set this to null before we return so that we cannot get stuck in a loop of returning this
                     // object from this listener. This is just a safeguard; that loop scenario should never occur.
@@ -472,7 +485,7 @@ public class NameNodeTCPClient {
                     connection.removeListener(this);
 
                     // Next, retrieve the enqueued object to send to the client.
-                    Object object = next();
+                    NameNodeResult object = next();
 
                     // If the enqueued object is NOT null, then we will try to send it. This is sort of a recursive
                     // call, since this listener was created within the trySendTcp() function. But we've already
@@ -481,7 +494,7 @@ public class NameNodeTCPClient {
                     // still clear. So, we try again. If it fails again, then at least this object gets enqueued,
                     // so it should eventually make it to the client.
                     if (object != null) {
-                        trySendTcp(connection, object, true);
+                        trySendTcp(connection, object);
                     }
                 }
             });
@@ -490,6 +503,7 @@ public class NameNodeTCPClient {
 //            if (LOG.isDebugEnabled())
 //                LOG.debug("[TCP Client] Write buffer for connection " + connection.getRemoteAddressTCP() +
 //                        " is at " + (currentCapacity * 100) + "% capacity! Sending payload immediately.");
+            payload.prepare(serverlessNameNode.getNamesystem().getMetadataCacheManager());
             sendTcp(connection, payload);
         }
     }
@@ -526,8 +540,7 @@ public class NameNodeTCPClient {
         }
     }
 
-    private NameNodeResult handleWorkAssignment(JsonObject args) {
-        long startTime = System.currentTimeMillis();
+    private NameNodeResult handleWorkAssignment(JsonObject args, long startTime) {
         String requestId = args.getAsJsonPrimitive(ServerlessNameNodeKeys.REQUEST_ID).getAsString();
         String op = args.getAsJsonPrimitive(ServerlessNameNodeKeys.OPERATION).getAsString();
         JsonObject fsArgs = args.getAsJsonObject(ServerlessNameNodeKeys.FILE_SYSTEM_OP_ARGS);
@@ -541,7 +554,8 @@ public class NameNodeTCPClient {
             ConsistencyProtocol.DO_CONSISTENCY_PROTOCOL = args.get(CONSISTENCY_PROTOCOL_ENABLED).getAsBoolean();
         }
 
-        NameNodeResult tcpResult = new NameNodeResult(deploymentNumber, requestId, "TCP", serverlessNameNode.getId());
+        NameNodeResult tcpResult = new NameNodeResult(deploymentNumber, requestId, "TCP",
+                serverlessNameNode.getId(), op);
         tcpResult.setFnStartTime(startTime);
 
         if (LOG.isDebugEnabled()) {

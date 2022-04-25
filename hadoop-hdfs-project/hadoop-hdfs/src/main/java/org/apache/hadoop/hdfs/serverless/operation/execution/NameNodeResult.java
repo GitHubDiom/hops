@@ -49,7 +49,7 @@ import static org.apache.hadoop.hdfs.serverless.ServerlessNameNodeKeys.*;
  *
  * This is used on the NameNode side.
  */
-public class NameNodeResult implements Serializable {
+public final class NameNodeResult implements Serializable {
     //private static final io.nuclio.Logger LOG = NuclioHandler.NUCLIO_LOGGER;
     public static final Logger LOG = LoggerFactory.getLogger(NameNodeResult.class);
     private static final long serialVersionUID = -6018521672360252605L;
@@ -72,7 +72,7 @@ public class NameNodeResult implements Serializable {
     /**
      * Exceptions encountered during the current request's execution.
      */
-    private final ArrayList<Throwable> exceptions;
+    private ArrayList<Throwable> exceptions;
 
     /**
      * The desired result of the current request's execution.
@@ -86,8 +86,15 @@ public class NameNodeResult implements Serializable {
 
     /**
      * Transaction events that have been serialized and encoded.
+     * Only used for HTTP requests. TCP requests use the {@code txEvents} variable.
      */
     private String txEventsSerializedAndEncoded;
+
+    /**
+     * TX events. A TX Event encapsulates metric information about a particular transaction.
+     * Only used for TCP requests. HTTP requests use the {@code txEventsSerializedAndEncoded} variable.
+     */
+    private List<TransactionEvent> txEvents;
 
     /**
      * We may be returning a mapping of a file or directory to a particular serverless function.
@@ -97,7 +104,7 @@ public class NameNodeResult implements Serializable {
     /**
      * The name of the serverless function all of this is running in/on.
      */
-    private final int deploymentNumber;
+    private int deploymentNumber;
 
     /**
      * The unique ID of the current NameNode instance.
@@ -116,27 +123,25 @@ public class NameNodeResult implements Serializable {
     private boolean coldStart = false;
 
     /**
-     * Any extra fields to be added explicitly/directly to the result payload. As of right now,
-     * only strings are supported as additional fields.
-     *
-     * These will be added as a top-level key/value pair to the JSON payload returned to the client.
-     */
-    private final HashMap<String, String> additionalFields;
-
-    /**
      * Request ID associated with this result.
      */
-    private final String requestId;
+    private String requestId;
 
     /**
      * HTTP or TCP.
      */
-    private final String requestMethod;
+    private String requestMethod;
 
     /**
      * Time at which the serverless function received the request associated with this result.
      */
     private long fnStartTime;
+
+    /**
+     * Roughly the time at which the FN exited. This is set in the {@code prepare} method, which is supposed to be
+     * called as the last step before sending this result back to the client (either via TCP or HTTP).
+     */
+    private long fnEndTime;
 
     /**
      * Time at which this request was enqueued in the NameNode's work queue.
@@ -156,6 +161,26 @@ public class NameNodeResult implements Serializable {
     private long processingFinishedTime;
 
     /**
+     * Name of the FS operation we performed.
+     */
+    private String operationName;
+
+    /**
+     * Indicates whether this result corresponds to a duplicate request.
+     */
+    private boolean isDuplicate = false;
+
+    /**
+     * Number of metadata cache hits that occurred while executing the corresponding FS operation.
+     */
+    private int metadataCacheHits = 0;
+
+    /**
+     * Number of metadata cache misses that occurred while executing the corresponding FS operation.
+     */
+    private int metadataCacheMisses = 0;
+
+    /**
      * The UTC timestamp at which this result was (theoretically) delivered back to the client.
      *
      * A value of -1 indicates that this result has not yet been delivered. A non-negative value
@@ -164,13 +189,18 @@ public class NameNodeResult implements Serializable {
      */
     private long timeDeliveredBackToClient = -1L;
 
-    public NameNodeResult(int deploymentNumber, String requestId, String requestMethod, long nameNodeId) {
+    public NameNodeResult(int deploymentNumber, String requestId, String requestMethod, long nameNodeId, String operationName) {
         this.deploymentNumber = deploymentNumber;
         this.nameNodeId = nameNodeId;
         this.requestId = requestId;
         this.exceptions = new ArrayList<>();
-        this.additionalFields = new HashMap<>();
         this.requestMethod = requestMethod;
+        this.operationName = operationName;
+    }
+
+    // Empty constructor used for Kryo serialization.
+    private NameNodeResult() {
+
     }
 
     /**
@@ -201,18 +231,6 @@ public class NameNodeResult implements Serializable {
      */
     public void addFunctionMapping(String fileOrDirectory, long parentId, int mappedFunctionName) {
         this.serverlessFunctionMapping = new ServerlessFunctionMapping(fileOrDirectory, parentId, mappedFunctionName);
-    }
-
-    /**
-     * Explicitly add an entry as a top-level key/value pair to the payload returned to the client.
-     * This should only be used for entries that are not covered by the rest of the API.
-     * Note that this will overwrite existing values with the same key.
-     *
-     * @param key The key to use for the entry.
-     * @param value The value to be used for the entry.
-     */
-    public void addExtraString(String key, String value) {
-        this.additionalFields.put(key, value);
     }
 
     public void setColdStart(boolean coldStart) {
@@ -375,15 +393,6 @@ public class NameNodeResult implements Serializable {
             json.set(DEPLOYMENT_MAPPING, functionMapping);
         }
 
-        if (additionalFields.size() > 0) {
-            for (Map.Entry<String, String> entry : additionalFields.entrySet()) {
-                String key = entry.getKey();
-                String value = entry.getValue();
-
-                json.put(key, value);
-            }
-        }
-
         if (operation != null)
             json.put(ServerlessNameNodeKeys.OPERATION, operation);
 
@@ -416,6 +425,27 @@ public class NameNodeResult implements Serializable {
         json.put(ServerlessNameNodeKeys.FN_END_TIME, System.currentTimeMillis());
         return json;
     }
+
+    /**
+     * Called before sending the result via TCP.
+     */
+    public void prepare(MetadataCacheManager metadataCacheManager) {
+        InMemoryINodeCache metadataCache = metadataCacheManager.getINodeCache();
+        ReplicaCacheManager replicaCacheManager = metadataCacheManager.getReplicaCacheManager();
+
+        if (result instanceof DuplicateRequest)
+            isDuplicate = true;
+
+        metadataCacheHits = metadataCache.getNumCacheHitsCurrentRequest();      // + replicaCacheManager.getThreadLocalCacheHits();
+        metadataCacheMisses = metadataCache.getNumCacheMissesCurrentRequest();  // + replicaCacheManager.getThreadLocalCacheMisses();
+
+        metadataCache.resetCacheHitMissCounters();
+        replicaCacheManager.resetCacheHitMissCounters();
+
+        fnEndTime = System.currentTimeMillis();
+    }
+
+    public List<TransactionEvent> getTxEvents() { return this.txEvents; }
 
     /**
      * Convert this object to a JsonObject so that it can be returned directly to the invoker.
@@ -474,15 +504,6 @@ public class NameNodeResult implements Serializable {
             json.add(DEPLOYMENT_MAPPING, functionMapping);
         }
 
-        if (additionalFields.size() > 0) {
-            for (Map.Entry<String, String> entry : additionalFields.entrySet()) {
-                String key = entry.getKey();
-                String value = entry.getValue();
-
-                json.addProperty(key, value);
-            }
-        }
-
         if (operation != null)
             json.addProperty(ServerlessNameNodeKeys.OPERATION, operation);
 
@@ -528,10 +549,58 @@ public class NameNodeResult implements Serializable {
         }
     }
 
+    public ArrayList<Throwable> getExceptions() {
+        return exceptions;
+    }
+
+    public Serializable getResult() {
+        return result;
+    }
+
+    public ServerlessFunctionMapping getServerlessFunctionMapping() {
+        return serverlessFunctionMapping;
+    }
+
+    public int getDeploymentNumber() {
+        return deploymentNumber;
+    }
+
+    public long getNameNodeId() {
+        return nameNodeId;
+    }
+
+    public boolean isHasResult() {
+        return hasResult;
+    }
+
+    public boolean isColdStart() {
+        return coldStart;
+    }
+
+    public String getRequestId() {
+        return requestId;
+    }
+
+    public String getOperationName() {
+        return operationName;
+    }
+
+    public String getRequestMethod() {
+        return requestMethod;
+    }
+
     public void commitTransactionEvents(List<TransactionEvent> transactionEvents) {
         if (transactionEvents != null) {
-            this.txEventsSerializedAndEncoded = serializeAndEncode(transactionEvents);
+            if (this.requestMethod.equals("HTTP"))
+                this.txEventsSerializedAndEncoded = serializeAndEncode(transactionEvents);
+            else
+                this.txEvents = transactionEvents;
         }
+    }
+
+    @Override
+    public String toString() {
+        return "NameNodeResult(RequestID=" + requestId + ", OperationName=" + operationName + ")";
     }
 
     /**
@@ -595,6 +664,10 @@ public class NameNodeResult implements Serializable {
         return fnStartTime;
     }
 
+    public long getFnEndTime() {
+        return fnEndTime;
+    }
+
     public void setFnStartTime(long fnStartTime) {
         this.fnStartTime = fnStartTime;
     }
@@ -619,24 +692,38 @@ public class NameNodeResult implements Serializable {
 
     public long getProcessingFinishedTime() { return processingFinishedTime; }
 
+    public int getMetadataCacheHits() {
+        return metadataCacheHits;
+    }
+
+    public boolean isDuplicate() {
+        return isDuplicate;
+    }
+
+    public int getMetadataCacheMisses() {
+        return metadataCacheMisses;
+    }
+
     /**
      * Encapsulates the mapping of a particular file or directory to a particular serverless function.
      */
-    static class ServerlessFunctionMapping {
+    public static class ServerlessFunctionMapping implements Serializable {
+        private static final long serialVersionUID = 7649887040567903783L;
+
         /**
          * The file or directory that we're mapping to a serverless function.
          */
-        String fileOrDirectory;
+        public String fileOrDirectory;
 
         /**
          * The ID of the file or directory's parent iNode.
          */
-        long parentId;
+        public long parentId;
 
         /**
          * The number of the serverless function to which the file or directory was mapped.
          */
-        int mappedFunctionNumber;
+        public int mappedFunctionNumber;
 
         public ServerlessFunctionMapping(String fileOrDirectory, long parentId, int mappedFunctionNumber) {
             this.fileOrDirectory = fileOrDirectory;
