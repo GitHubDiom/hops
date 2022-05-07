@@ -380,6 +380,13 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
     this.serverlessInvoker.setTransactionEvents(merged);
   }
 
+  public void setBenchmarkModeEnabled(boolean benchmarkModeEnabled) {
+    if (this.namenode instanceof ServerlessNameNodeClient) {
+      ServerlessNameNodeClient client = (ServerlessNameNodeClient) this.namenode;
+      client.setBenchmarkModeEnabled(benchmarkModeEnabled);
+    }
+  }
+
   /**
    * Return the statistics packages from the invoker.
    */
@@ -1702,6 +1709,15 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
   }
 
   public void addOperationPerformeds(Collection<OperationPerformed> operationPerformeds) {
+    if (namenode instanceof ServerlessNameNodeClient) {
+      ServerlessNameNodeClient client = (ServerlessNameNodeClient)namenode;
+      client.addOperationPerformeds(operationPerformeds);
+    } else {
+      throw new IllegalStateException("The internal NameNode client is not of the correct type. That is, it does not implement any Serverless APIs.");
+    }
+  }
+
+  public void addOperationPerformeds(OperationPerformed[] operationPerformeds) {
     if (namenode instanceof ServerlessNameNodeClient) {
       ServerlessNameNodeClient client = (ServerlessNameNodeClient)namenode;
       client.addOperationPerformeds(operationPerformeds);

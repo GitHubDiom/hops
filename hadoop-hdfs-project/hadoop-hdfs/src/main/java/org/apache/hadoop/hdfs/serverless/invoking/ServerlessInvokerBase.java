@@ -8,6 +8,7 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
+import org.apache.hadoop.hdfs.serverless.OpenWhiskHandler;
 import org.apache.hadoop.hdfs.serverless.ServerlessNameNodeKeys;
 import org.apache.hadoop.hdfs.serverless.cache.FunctionMetadataMap;
 import org.apache.hadoop.hdfs.serverless.operation.execution.NullResult;
@@ -179,12 +180,15 @@ public abstract class ServerlessInvokerBase<T> {
      * If False, then we'll tell the NameNodes not to try connecting to the TCP server.
      */
     protected boolean tcpEnabled;
+    protected boolean udpEnabled;
 
     /**
      * The TCP port that we ultimately bound to. See the comment in 'ServerlessNameNodeClient' for its
      * 'tcpServerPort' instance field for explanation as to why this field exists.
      */
     protected int tcpPort;
+
+    protected int udpPort;
 
     /**
      * The timeout, in milliseconds, for an HTTP request to a NameNode. This specifically
@@ -202,6 +206,11 @@ public abstract class ServerlessInvokerBase<T> {
      * Passed to serverless functions. Determines whether they execute the consistency protocol.
      */
     protected boolean consistencyProtocolEnabled = true;
+
+    /**
+     * Turns off metric collection to save time, network transfer, and memory.
+     */
+    protected boolean benchmarkModeEnabled = false;
 
     /**
      * Return the INode-NN mapping cache entry for the given file or directory.
@@ -222,27 +231,27 @@ public abstract class ServerlessInvokerBase<T> {
         String json = EntityUtils.toString(httpResponse.getEntity(), "UTF-8");
         Gson gson = new Gson();
 
-        int responseCode = httpResponse.getStatusLine().getStatusCode();
-        String reasonPhrase = httpResponse.getStatusLine().getReasonPhrase();
-        String protocolVersion = httpResponse.getStatusLine().getProtocolVersion().toString();
-
-        Header contentType = httpResponse.getEntity().getContentType();
-        long contentLength = httpResponse.getEntity().getContentLength();
-
-        if (LOG.isDebugEnabled()) {
-            LOG.debug("====== HTTP RESPONSE ======");
-            LOG.debug(protocolVersion + " - " + responseCode);
-            LOG.debug(reasonPhrase);
-            LOG.debug("---------------------------");
-            if (contentType != null)
-                LOG.debug(contentType.getName() + ": " + contentType.getValue());
-            LOG.debug("Content-length: " + contentLength);
-            LOG.debug("===========================");
-
-            LOG.debug("HTTP Response from function:\n" + httpResponse);
-//            LOG.debug("HTTP Response Entity: " + httpResponse.getEntity());
-//            LOG.debug("HTTP Response Entity Content: " + json);
-        }
+//        int responseCode = httpResponse.getStatusLine().getStatusCode();
+//        String reasonPhrase = httpResponse.getStatusLine().getReasonPhrase();
+//        String protocolVersion = httpResponse.getStatusLine().getProtocolVersion().toString();
+//
+//        Header contentType = httpResponse.getEntity().getContentType();
+//        long contentLength = httpResponse.getEntity().getContentLength();
+//
+//        if (LOG.isDebugEnabled()) {
+//            LOG.debug("====== HTTP RESPONSE ======");
+//            LOG.debug(protocolVersion + " - " + responseCode);
+//            LOG.debug(reasonPhrase);
+//            LOG.debug("---------------------------");
+//            if (contentType != null)
+//                LOG.debug(contentType.getName() + ": " + contentType.getValue());
+//            LOG.debug("Content-length: " + contentLength);
+//            LOG.debug("===========================");
+//
+//            LOG.debug("HTTP Response from function:\n" + httpResponse);
+////            LOG.debug("HTTP Response Entity: " + httpResponse.getEntity());
+////            LOG.debug("HTTP Response Entity Content: " + json);
+//        }
 
         JsonObject jsonObjectResponse = null;
         JsonPrimitive jsonPrimitiveResponse = null;
@@ -315,6 +324,14 @@ public abstract class ServerlessInvokerBase<T> {
     }
 
     /**
+     * Update the UDP port being used by this client's UDP server.
+     * @param udpPort The new value for the UDP port.
+     */
+    public void setUdpPort(int udpPort) {
+        this.udpPort = udpPort;
+    }
+
+    /**
      * Default constructor.
      */
     protected ServerlessInvokerBase() {
@@ -329,11 +346,12 @@ public abstract class ServerlessInvokerBase<T> {
     public void setConfiguration(Configuration conf, String invokerIdentity) {
         if (LOG.isDebugEnabled()) LOG.debug("Configuring ServerlessInvokerBase now...");
         cache = new FunctionMetadataMap(conf);
-        this.localMode = conf.getBoolean(SERVERLESS_LOCAL_MODE, SERVERLESS_LOCAL_MODE_DEFAULT);
+        localMode = conf.getBoolean(SERVERLESS_LOCAL_MODE, SERVERLESS_LOCAL_MODE_DEFAULT);
         maxHttpRetries = conf.getInt(DFSConfigKeys.SERVERLESS_HTTP_RETRY_MAX,
                 DFSConfigKeys.SERVERLESS_HTTP_RETRY_MAX_DEFAULT);
         tcpEnabled = conf.getBoolean(DFSConfigKeys.SERVERLESS_TCP_REQUESTS_ENABLED,
                 DFSConfigKeys.SERVERLESS_TCP_REQUESTS_ENABLED_DEFAULT);
+        udpEnabled = conf.getBoolean(SERVERLESS_USE_UDP, SERVERLESS_USE_UDP_DEFAULT);
         httpTimeoutMilliseconds = conf.getInt(DFSConfigKeys.SERVERLESS_HTTP_TIMEOUT,
                 DFSConfigKeys.SERVERLESS_HTTP_TIMEOUT_DEFAULT) * 1000; // Convert from seconds to milliseconds.
 
@@ -347,9 +365,13 @@ public abstract class ServerlessInvokerBase<T> {
         // NDB
         debugEnabledNdb = conf.getBoolean(DFSConfigKeys.NDB_DEBUG, DFSConfigKeys.NDB_DEBUG_DEFAULT);
         debugStringNdb = conf.get(DFSConfigKeys.NDB_DEBUG_STRING, DFSConfigKeys.NDB_DEBUG_STRING_DEFAULT);
-        if (LOG.isDebugEnabled()) LOG.debug("NDB debug enabled: " + debugEnabledNdb);
-        if (debugEnabledNdb && LOG.isDebugEnabled())
-            LOG.debug("NDB debug string: " + debugStringNdb);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("NDB debug enabled: " + debugEnabledNdb);
+            LOG.debug("TCP Enabled: " + tcpEnabled);
+            LOG.debug("UDP Enabled: " + udpEnabled);
+
+            if (debugEnabledNdb) LOG.debug("NDB debug string: " + debugStringNdb);
+        }
 
         try {
             httpClient = getHttpClient();
@@ -496,10 +518,10 @@ public abstract class ServerlessInvokerBase<T> {
                 httpResponse = httpClient.execute(request);
                 currentTime = System.nanoTime();
                 timeElapsed = (currentTime - invokeStart) / 1000000.0;
-                if (LOG.isDebugEnabled())
-                    LOG.debug("Received HTTP response for request/task " + requestId + " (op=" + operationName +"). Time elapsed: " + timeElapsed + " milliseconds.");
-
                 int responseCode = httpResponse.getStatusLine().getStatusCode();
+
+                if (LOG.isDebugEnabled())
+                    LOG.debug("Received HTTP " + responseCode + " response for request/task " + requestId + " (op=" + operationName +"). Time elapsed: " + timeElapsed + " milliseconds.");
 
                 // If we receive a 4XX or 5XX response code, then we should re-try. HTTP 4XX errors
                 // generally indicate a client error, but sometimes I receive this error right after
@@ -840,14 +862,17 @@ public abstract class ServerlessInvokerBase<T> {
         nameNodeArgumentsJson.addProperty(DEBUG_NDB, debugEnabledNdb);
         nameNodeArgumentsJson.addProperty(DEBUG_STRING_NDB, debugStringNdb);
         nameNodeArgumentsJson.addProperty(TCP_PORT, tcpPort);
+        nameNodeArgumentsJson.addProperty(UDP_PORT, udpPort);
+        nameNodeArgumentsJson.addProperty(BENCHMARK_MODE, benchmarkModeEnabled);
 
         // If we aren't a client invoker (e.g., DataNode, other NameNode, etc.), then don't populate the internal IP field.
         nameNodeArgumentsJson.addProperty(CLIENT_INTERNAL_IP, (isClientInvoker ? InvokerUtilities.getInternalIpAddress() : "0.0.0.0"));
 
         nameNodeArgumentsJson.addProperty(TCP_ENABLED, tcpEnabled);
+        nameNodeArgumentsJson.addProperty(UDP_ENABLED, udpEnabled);
         nameNodeArgumentsJson.addProperty(LOCAL_MODE, localMode);
         nameNodeArgumentsJson.addProperty(CONSISTENCY_PROTOCOL_ENABLED, consistencyProtocolEnabled);
-        nameNodeArgumentsJson.addProperty(LOG_LEVEL, serverlessFunctionLogLevel);
+        nameNodeArgumentsJson.addProperty(LOG_LEVEL, OpenWhiskHandler.getLogLevelIntFromString(serverlessFunctionLogLevel));
     }
 
     ///////////////////////

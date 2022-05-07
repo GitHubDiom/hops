@@ -1,11 +1,10 @@
-package org.apache.hadoop.hdfs.serverless.operation.execution;
+package org.apache.hadoop.hdfs.serverless.operation.execution.results;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
-import io.hops.leader_election.node.ActiveNode;
 import io.hops.metrics.TransactionAttempt;
 import io.hops.metrics.TransactionEvent;
 import io.hops.transaction.context.TransactionsStats;
@@ -16,68 +15,29 @@ import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
 import org.apache.hadoop.hdfs.protocol.LastBlockWithStatus;
 import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
 import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
-import org.apache.hadoop.hdfs.serverless.ServerlessNameNodeKeys;
 import org.apache.hadoop.hdfs.serverless.cache.InMemoryINodeCache;
 import org.apache.hadoop.hdfs.serverless.cache.MetadataCacheManager;
 import org.apache.hadoop.hdfs.serverless.cache.ReplicaCacheManager;
 import org.apache.hadoop.hdfs.serverless.operation.ActiveServerlessNameNode;
 import org.apache.hadoop.hdfs.serverless.operation.ActiveServerlessNameNodeList;
-import org.apache.hadoop.util.Time;
+import org.apache.hadoop.hdfs.serverless.operation.execution.DuplicateRequest;
+import org.nustaq.serialization.FSTConfiguration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.nustaq.serialization.FSTConfiguration;
 
-import java.io.ByteArrayOutputStream;
-import java.io.ObjectOutputStream;
 import java.io.Serializable;
+import java.lang.management.GarbageCollectorMXBean;
+import java.lang.management.ManagementFactory;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 
 import static org.apache.hadoop.hdfs.serverless.ServerlessNameNodeKeys.*;
 
-/**
- * This encapsulates all the information that may be returned to the user after the NameNode executes.
- *
- * This includes final results from FS operations, exceptions, INode mapping information, etc.
- *
- * As the NameNode executes, it adds any exceptions it encounters to this class' list. When it comes time to
- * return to the client, this class dumps all of its data into a JsonObject that the client will know how to process.
- *
- * This is used on the NameNode side.
- */
-public final class NameNodeResult implements Serializable {
-    //private static final io.nuclio.Logger LOG = NuclioHandler.NUCLIO_LOGGER;
-    public static final Logger LOG = LoggerFactory.getLogger(NameNodeResult.class);
+public final class NameNodeResultWithMetrics extends NameNodeResult {
+    public static final Logger LOG = LoggerFactory.getLogger(NameNodeResultWithMetrics.class);
     private static final long serialVersionUID = -6018521672360252605L;
-
-    /**
-     * From RuedigerMoeller/fast-serialization.
-     */
-    private static final FSTConfiguration conf = FSTConfiguration.createDefaultConfiguration();
-
-    /**
-     * One easy and important optimization is to register classes which are serialized for sure in your application
-     * at the FSTConfiguration object. This way FST can avoid writing classnames.
-     */
-    static {
-        conf.registerClass(LocatedBlocks.class, TransactionEvent.class, TransactionAttempt.class, NamespaceInfo.class,
-                LastBlockWithStatus.class, HdfsFileStatus.class, DirectoryListing.class, FsServerDefaults.class,
-                ActiveServerlessNameNodeList.class, ActiveServerlessNameNode.class);
-    }
-
-    /**
-     * Exceptions encountered during the current request's execution.
-     */
-    private ArrayList<Throwable> exceptions;
-
-    /**
-     * The desired result of the current request's execution.
-     */
-    private Serializable result;
 
     /**
      * These are committed to the result object right after its associated operation has been completed.
@@ -97,11 +57,6 @@ public final class NameNodeResult implements Serializable {
     private List<TransactionEvent> txEvents;
 
     /**
-     * We may be returning a mapping of a file or directory to a particular serverless function.
-     */
-    private ServerlessFunctionMapping serverlessFunctionMapping;
-
-    /**
      * The name of the serverless function all of this is running in/on.
      */
     private int deploymentNumber;
@@ -112,20 +67,10 @@ public final class NameNodeResult implements Serializable {
     private long nameNodeId;
 
     /**
-     * Flag which indicates whether there is a result.
-     */
-    private boolean hasResult = false;
-
-    /**
      * Indicates whether the NameNode was cold-started when computing this result.
      * Only used for HTTP, as TCP cannot be used except with warm NameNodes.
      */
     private boolean coldStart = false;
-
-    /**
-     * Request ID associated with this result.
-     */
-    private String requestId;
 
     /**
      * HTTP or TCP.
@@ -161,16 +106,6 @@ public final class NameNodeResult implements Serializable {
     private long processingFinishedTime;
 
     /**
-     * Name of the FS operation we performed.
-     */
-    private String operationName;
-
-    /**
-     * Indicates whether this result corresponds to a duplicate request.
-     */
-    private boolean isDuplicate = false;
-
-    /**
      * Number of metadata cache hits that occurred while executing the corresponding FS operation.
      */
     private int metadataCacheHits = 0;
@@ -189,77 +124,56 @@ public final class NameNodeResult implements Serializable {
      */
     private long timeDeliveredBackToClient = -1L;
 
-    public NameNodeResult(int deploymentNumber, String requestId, String requestMethod, long nameNodeId, String operationName) {
+    /**
+     * The approximate number of collections that occurred while the NN was executing the task associated with this
+     * NameNodeResult instance.
+     *
+     * This initially set to the number of GCs that have occurred up until the point at which the NN begins
+     * executing the task associated with this NameNodeResult instance. This value is then used to compute the
+     * number of collections that have occurred while the NN executed the associated task.
+     */
+    private long numGarbageCollections;
+
+    /**
+     * The approximate time, in milliseconds, that has elapsed during GCs while the NN executed this task.
+     *
+     * This initially set to the elapsed time until the point at which the NN begins executing the task associated with
+     * this NameNodeResult instance. This value is then used to compute the elapsed time during collections while the
+     * NN executed the associated task.
+     */
+    private long garbageCollectionTime;
+
+    public NameNodeResultWithMetrics(int deploymentNumber, String requestId, String requestMethod, long nameNodeId, String operationName) {
+        super(requestId, operationName);
         this.deploymentNumber = deploymentNumber;
         this.nameNodeId = nameNodeId;
-        this.requestId = requestId;
         this.exceptions = new ArrayList<>();
         this.requestMethod = requestMethod;
-        this.operationName = operationName;
+
+        List<GarbageCollectorMXBean> mxBeans = ManagementFactory.getGarbageCollectorMXBeans();
+        this.numGarbageCollections = 0L;
+        this.garbageCollectionTime = 0L;
+        for (GarbageCollectorMXBean mxBean : mxBeans) {
+            long count = mxBean.getCollectionCount();
+            long time  = mxBean.getCollectionTime();
+
+            if (count > 0)
+                this.numGarbageCollections += count;
+
+            if (time > 0)
+                this.garbageCollectionTime += time;
+        }
     }
 
     // Empty constructor used for Kryo serialization.
-    private NameNodeResult() {
+    private NameNodeResultWithMetrics() {super(); }
 
-    }
+    public long getNumGarbageCollections() { return numGarbageCollections; }
 
-    /**
-     * Update the result field of this request's execution.
-     * @param result The result of executing the desired operation.
-     * @param forceOverwrite If true, overwrite an existing result.
-     * @return True if the result was stored, otherwise false.
-     */
-    public boolean addResult(Serializable result, boolean forceOverwrite) {
-        if (result == null || forceOverwrite) {
-            this.result = result;
-            hasResult = true;
-            return true;
-        } else {
-            LOG.warn("Cannot overwrite existing result of type " + result.getClass().getSimpleName() + ".");
-        }
-
-        return false;
-    }
-
-    /**
-     * Store the file/directory-to-serverless-function mapping information so that it may be returned to
-     * whoever invoked us.
-     *
-     * @param fileOrDirectory The file or directory being mapped to a function.
-     * @param parentId The ID of the file or directory's parent iNode.
-     * @param mappedFunctionName The name of the serverless function to which the file or directory was mapped.
-     */
-    public void addFunctionMapping(String fileOrDirectory, long parentId, int mappedFunctionName) {
-        this.serverlessFunctionMapping = new ServerlessFunctionMapping(fileOrDirectory, parentId, mappedFunctionName);
-    }
+    public long getGarbageCollectionTime() { return garbageCollectionTime; }
 
     public void setColdStart(boolean coldStart) {
         this.coldStart = coldStart;
-    }
-
-    /**
-     * Formally record/take note that an exception occurred.
-     * @param ex The exception that occurred.
-     */
-    public void addException(Exception ex) {
-        addThrowable(ex);
-    }
-
-    /**
-     * Returns true if there's a result, otherwise false.
-     */
-    public boolean getHasResult() {
-        return hasResult;
-    }
-
-    /**
-     * Essentially an alias for `addException()`, though there are Throwables that are not exceptions (e.g.,
-     * IllegalAccessError) that we could encounter.
-     *
-     * @param t The exception/throwable to record.
-     */
-    public void addThrowable(Throwable t) {
-        exceptions.add(t);
     }
 
     /**
@@ -316,24 +230,6 @@ public final class NameNodeResult implements Serializable {
         LOG.debug("+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+\n");
     }
 
-    public String serializeAndEncode(Object object) {
-//        try (ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream()) {
-//            ObjectOutputStream objectOutputStream = new ObjectOutputStream(byteArrayOutputStream);
-//            objectOutputStream.writeObject(object);
-//            objectOutputStream.flush();
-//
-//            byte[] objectBytes = byteArrayOutputStream.toByteArray();
-//
-//            return Base64.encodeBase64String(objectBytes);
-//        } catch (Exception ex) {
-//            LOG.error("Exception encountered whilst serializing result of file system operation: ", ex);
-//            addException(ex);
-//        }
-
-        byte[] objectBytes = conf.asByteArray(object);
-        return Base64.encodeBase64String(objectBytes);
-    }
-
     /**
      * Convert this object to a JsonObject so that it can be returned directly to the invoker.
      *
@@ -360,7 +256,7 @@ public final class NameNodeResult implements Serializable {
         // a duplicate request and leave it at that.
         if (result instanceof DuplicateRequest) {
             // Add a flag indicating whether this is just a duplicate result.
-            json.put(ServerlessNameNodeKeys.DUPLICATE_REQUEST, true);
+            json.put(DUPLICATE_REQUEST, true);
         } else {
             if (result != null && LOG.isDebugEnabled())
                 LOG.debug("Returning result of type " + result.getClass().getSimpleName()
@@ -369,8 +265,8 @@ public final class NameNodeResult implements Serializable {
             String resultSerializedAndEncoded = serializeAndEncode(result);
 
             if (resultSerializedAndEncoded != null)
-                json.put(ServerlessNameNodeKeys.RESULT, resultSerializedAndEncoded);
-            json.put(ServerlessNameNodeKeys.DUPLICATE_REQUEST, false);
+                json.put(RESULT, resultSerializedAndEncoded);
+            json.put(DUPLICATE_REQUEST, false);
         }
 
         if (exceptions.size() > 0) {
@@ -380,7 +276,7 @@ public final class NameNodeResult implements Serializable {
                 exceptionsJson.add(t.toString());
             }
 
-            json.set(ServerlessNameNodeKeys.EXCEPTIONS, exceptionsJson);
+            json.set(EXCEPTIONS, exceptionsJson);
         }
 
         if (serverlessFunctionMapping != null) {
@@ -394,41 +290,61 @@ public final class NameNodeResult implements Serializable {
         }
 
         if (operation != null)
-            json.put(ServerlessNameNodeKeys.OPERATION, operation);
+            json.put(OPERATION, operation);
 
-        json.put(ServerlessNameNodeKeys.NAME_NODE_ID, nameNodeId);
-        json.put(ServerlessNameNodeKeys.DEPLOYMENT_NUMBER, deploymentNumber);
-        json.put(ServerlessNameNodeKeys.REQUEST_ID, requestId);
-        json.put(ServerlessNameNodeKeys.REQUEST_METHOD, requestMethod);
-        json.put(ServerlessNameNodeKeys.CANCELLED, false);
-        json.put(ServerlessNameNodeKeys.OPENWHISK_ACTIVATION_ID, "N/A"); //System.getenv("__OW_ACTIVATION_ID"));
+        long numGarbageCollectionsNow = 0L;
+        long garbageCollectionTimeNow = 0L;
+        List<GarbageCollectorMXBean> mxBeans = ManagementFactory.getGarbageCollectorMXBeans();
+        for (GarbageCollectorMXBean mxBean : mxBeans) {
+            long count = mxBean.getCollectionCount();
+            long time  = mxBean.getCollectionTime();
+
+            if (count > 0)
+                numGarbageCollectionsNow += count;
+
+            if (time > 0)
+                garbageCollectionTimeNow += time;
+        }
+
+        numGarbageCollections = numGarbageCollectionsNow - numGarbageCollections;
+        garbageCollectionTime = garbageCollectionTimeNow - garbageCollectionTime;
+
+        json.put(NAME_NODE_ID, nameNodeId);
+        json.put(DEPLOYMENT_NUMBER, deploymentNumber);
+        json.put(REQUEST_ID, requestId);
+        json.put(REQUEST_METHOD, requestMethod);
+        json.put(CANCELLED, false);
+        json.put(OPENWHISK_ACTIVATION_ID, "N/A"); //System.getenv("__OW_ACTIVATION_ID"));
         int totalCacheHits = metadataCache.getNumCacheHitsCurrentRequest(); // + replicaCacheManager.getThreadLocalCacheHits();
         int totalCacheMisses = metadataCache.getNumCacheMissesCurrentRequest(); // + replicaCacheManager.getThreadLocalCacheMisses();
-        json.put(ServerlessNameNodeKeys.CACHE_HITS, totalCacheHits);
-        json.put(ServerlessNameNodeKeys.CACHE_MISSES, totalCacheMisses);
-        json.put(ServerlessNameNodeKeys.FN_START_TIME, fnStartTime);
-        json.put(ServerlessNameNodeKeys.ENQUEUED_TIME, enqueuedTime);
-        json.put(ServerlessNameNodeKeys.DEQUEUED_TIME, dequeuedTime);
-        json.put(ServerlessNameNodeKeys.PROCESSING_FINISHED_TIME, processingFinishedTime);
+        json.put(CACHE_HITS, totalCacheHits);
+        json.put(CACHE_MISSES, totalCacheMisses);
+        json.put(FN_START_TIME, fnStartTime);
+        json.put(ENQUEUED_TIME, enqueuedTime);
+        json.put(DEQUEUED_TIME, dequeuedTime);
+        json.put(PROCESSING_FINISHED_TIME, processingFinishedTime);
         json.put(COLD_START, coldStart);
+        json.put(NUMBER_OF_GCs, numGarbageCollections);
+        json.put(GC_TIME, garbageCollectionTime);
 
         if (statisticsPackageSerializedAndEncoded != null)
-            json.put(ServerlessNameNodeKeys.STATISTICS_PACKAGE, statisticsPackageSerializedAndEncoded);
+            json.put(STATISTICS_PACKAGE, statisticsPackageSerializedAndEncoded);
 
         if (txEventsSerializedAndEncoded != null)
-            json.put(ServerlessNameNodeKeys.TRANSACTION_EVENTS, txEventsSerializedAndEncoded);
+            json.put(TRANSACTION_EVENTS, txEventsSerializedAndEncoded);
 
         // Reset these in-case this thread gets re-used in the future for another request.
         metadataCache.resetCacheHitMissCounters();
         replicaCacheManager.resetCacheHitMissCounters();
 
-        json.put(ServerlessNameNodeKeys.FN_END_TIME, System.currentTimeMillis());
+        json.put(FN_END_TIME, System.currentTimeMillis());
         return json;
     }
 
     /**
      * Called before sending the result via TCP.
      */
+    @Override
     public void prepare(MetadataCacheManager metadataCacheManager) {
         InMemoryINodeCache metadataCache = metadataCacheManager.getINodeCache();
         ReplicaCacheManager replicaCacheManager = metadataCacheManager.getReplicaCacheManager();
@@ -441,6 +357,23 @@ public final class NameNodeResult implements Serializable {
 
         metadataCache.resetCacheHitMissCounters();
         replicaCacheManager.resetCacheHitMissCounters();
+
+        long numGarbageCollectionsNow = 0L;
+        long garbageCollectionTimeNow = 0L;
+        List<GarbageCollectorMXBean> mxBeans = ManagementFactory.getGarbageCollectorMXBeans();
+        for (GarbageCollectorMXBean mxBean : mxBeans) {
+            long count = mxBean.getCollectionCount();
+            long time  = mxBean.getCollectionTime();
+
+            if (count > 0)
+                numGarbageCollectionsNow += count;
+
+            if (time > 0)
+                garbageCollectionTimeNow += time;
+        }
+
+        numGarbageCollections = numGarbageCollectionsNow - numGarbageCollections;
+        garbageCollectionTime = garbageCollectionTimeNow - garbageCollectionTime;
 
         fnEndTime = System.currentTimeMillis();
     }
@@ -457,11 +390,9 @@ public final class NameNodeResult implements Serializable {
      * @param metadataCacheManager The manager of the in-memory metadata caches so we can get cache hit/miss metrics.
      *
      *                      We do NOT clear the counters on the metadataCache object after extracting them.
-     * @param operation If non-null, will be included as a top-level entry in the result under the key "op".
-     *                  This is used by TCP connections in particular, as TCP messages generally contain an "op"
-     *                  field to designate the request as one containing a result or one used for registration.
      */
-    public JsonObject toJson(String operation, MetadataCacheManager metadataCacheManager) {
+    @Override
+    public JsonObject toJson(MetadataCacheManager metadataCacheManager) {
         JsonObject json = new JsonObject();
         InMemoryINodeCache metadataCache = metadataCacheManager.getINodeCache();
         ReplicaCacheManager replicaCacheManager = metadataCacheManager.getReplicaCacheManager();
@@ -471,7 +402,7 @@ public final class NameNodeResult implements Serializable {
         // a duplicate request and leave it at that.
         if (result instanceof DuplicateRequest) {
             // Add a flag indicating whether this is just a duplicate result.
-            json.addProperty(ServerlessNameNodeKeys.DUPLICATE_REQUEST, true);
+            json.addProperty(DUPLICATE_REQUEST, true);
         } else {
             if (result != null && LOG.isDebugEnabled())
                 LOG.debug("Returning result of type " + result.getClass().getSimpleName()
@@ -480,8 +411,8 @@ public final class NameNodeResult implements Serializable {
             String resultSerializedAndEncoded = serializeAndEncode(result);
 
             if (resultSerializedAndEncoded != null)
-                json.addProperty(ServerlessNameNodeKeys.RESULT, resultSerializedAndEncoded);
-            json.addProperty(ServerlessNameNodeKeys.DUPLICATE_REQUEST, false);
+                json.addProperty(RESULT, resultSerializedAndEncoded);
+            json.addProperty(DUPLICATE_REQUEST, false);
         }
 
         if (exceptions.size() > 0) {
@@ -491,7 +422,7 @@ public final class NameNodeResult implements Serializable {
                 exceptionsJson.add(t.toString());
             }
 
-            json.add(ServerlessNameNodeKeys.EXCEPTIONS, exceptionsJson);
+            json.add(EXCEPTIONS, exceptionsJson);
         }
 
         if (serverlessFunctionMapping != null) {
@@ -504,36 +435,53 @@ public final class NameNodeResult implements Serializable {
             json.add(DEPLOYMENT_MAPPING, functionMapping);
         }
 
-        if (operation != null)
-            json.addProperty(ServerlessNameNodeKeys.OPERATION, operation);
+        long numGarbageCollectionsNow = 0L;
+        long garbageCollectionTimeNow = 0L;
+        List<GarbageCollectorMXBean> mxBeans = ManagementFactory.getGarbageCollectorMXBeans();
+        for (GarbageCollectorMXBean mxBean : mxBeans) {
+            long count = mxBean.getCollectionCount();
+            long time  = mxBean.getCollectionTime();
 
-        json.addProperty(ServerlessNameNodeKeys.NAME_NODE_ID, nameNodeId);
-        json.addProperty(ServerlessNameNodeKeys.DEPLOYMENT_NUMBER, deploymentNumber);
-        json.addProperty(ServerlessNameNodeKeys.REQUEST_ID, requestId);
-        json.addProperty(ServerlessNameNodeKeys.REQUEST_METHOD, requestMethod);
-        json.addProperty(ServerlessNameNodeKeys.CANCELLED, false);
-        json.addProperty(ServerlessNameNodeKeys.OPENWHISK_ACTIVATION_ID, System.getenv("__OW_ACTIVATION_ID"));
+            if (count > 0)
+                numGarbageCollectionsNow += count;
+
+            if (time > 0)
+                garbageCollectionTimeNow += time;
+        }
+
+        numGarbageCollections = numGarbageCollectionsNow - numGarbageCollections;
+        garbageCollectionTime = garbageCollectionTimeNow - garbageCollectionTime;
+
+        json.addProperty(NAME_NODE_ID, nameNodeId);
+        json.addProperty(DEPLOYMENT_NUMBER, deploymentNumber);
+        json.addProperty(REQUEST_ID, requestId);
+        json.addProperty(REQUEST_METHOD, requestMethod);
+        json.addProperty(CANCELLED, false);
+        json.addProperty(OPENWHISK_ACTIVATION_ID, System.getenv("__OW_ACTIVATION_ID"));
         int totalCacheHits = metadataCache.getNumCacheHitsCurrentRequest(); // + replicaCacheManager.getThreadLocalCacheHits();
         int totalCacheMisses = metadataCache.getNumCacheMissesCurrentRequest(); // + replicaCacheManager.getThreadLocalCacheMisses();
-        json.addProperty(ServerlessNameNodeKeys.CACHE_HITS, totalCacheHits);
-        json.addProperty(ServerlessNameNodeKeys.CACHE_MISSES, totalCacheMisses);
-        json.addProperty(ServerlessNameNodeKeys.FN_START_TIME, fnStartTime);
-        json.addProperty(ServerlessNameNodeKeys.ENQUEUED_TIME, enqueuedTime);
-        json.addProperty(ServerlessNameNodeKeys.DEQUEUED_TIME, dequeuedTime);
-        json.addProperty(ServerlessNameNodeKeys.PROCESSING_FINISHED_TIME, processingFinishedTime);
+        json.addProperty(CACHE_HITS, totalCacheHits);
+        json.addProperty(CACHE_MISSES, totalCacheMisses);
+        json.addProperty(FN_START_TIME, fnStartTime);
+        json.addProperty(ENQUEUED_TIME, enqueuedTime);
+        json.addProperty(DEQUEUED_TIME, dequeuedTime);
+        json.addProperty(PROCESSING_FINISHED_TIME, processingFinishedTime);
         json.addProperty(COLD_START, coldStart);
+        json.addProperty(NUMBER_OF_GCs, numGarbageCollections);
+        json.addProperty(GC_TIME, garbageCollectionTime);
+        json.addProperty(OPERATION, operationName);
 
         if (statisticsPackageSerializedAndEncoded != null)
-            json.addProperty(ServerlessNameNodeKeys.STATISTICS_PACKAGE, statisticsPackageSerializedAndEncoded);
+            json.addProperty(STATISTICS_PACKAGE, statisticsPackageSerializedAndEncoded);
 
         if (txEventsSerializedAndEncoded != null)
-            json.addProperty(ServerlessNameNodeKeys.TRANSACTION_EVENTS, txEventsSerializedAndEncoded);
+            json.addProperty(TRANSACTION_EVENTS, txEventsSerializedAndEncoded);
 
         // Reset these in-case this thread gets re-used in the future for another request.
         metadataCache.resetCacheHitMissCounters();
         replicaCacheManager.resetCacheHitMissCounters();
 
-        json.addProperty(ServerlessNameNodeKeys.FN_END_TIME, System.currentTimeMillis());
+        json.addProperty(FN_END_TIME, System.currentTimeMillis());
         return json;
     }
 
@@ -549,18 +497,6 @@ public final class NameNodeResult implements Serializable {
         }
     }
 
-    public ArrayList<Throwable> getExceptions() {
-        return exceptions;
-    }
-
-    public Serializable getResult() {
-        return result;
-    }
-
-    public ServerlessFunctionMapping getServerlessFunctionMapping() {
-        return serverlessFunctionMapping;
-    }
-
     public int getDeploymentNumber() {
         return deploymentNumber;
     }
@@ -569,20 +505,8 @@ public final class NameNodeResult implements Serializable {
         return nameNodeId;
     }
 
-    public boolean isHasResult() {
-        return hasResult;
-    }
-
     public boolean isColdStart() {
         return coldStart;
-    }
-
-    public String getRequestId() {
-        return requestId;
-    }
-
-    public String getOperationName() {
-        return operationName;
     }
 
     public String getRequestMethod() {
@@ -600,7 +524,7 @@ public final class NameNodeResult implements Serializable {
 
     @Override
     public String toString() {
-        return "NameNodeResult(RequestID=" + requestId + ", OperationName=" + operationName + ")";
+        return "NameNodeResultWithMetrics(RequestID=" + requestId + ", OperationName=" + operationName + ")";
     }
 
     /**
@@ -696,45 +620,7 @@ public final class NameNodeResult implements Serializable {
         return metadataCacheHits;
     }
 
-    public boolean isDuplicate() {
-        return isDuplicate;
-    }
-
     public int getMetadataCacheMisses() {
         return metadataCacheMisses;
-    }
-
-    /**
-     * Encapsulates the mapping of a particular file or directory to a particular serverless function.
-     */
-    public static class ServerlessFunctionMapping implements Serializable {
-        private static final long serialVersionUID = 7649887040567903783L;
-
-        /**
-         * The file or directory that we're mapping to a serverless function.
-         */
-        public String fileOrDirectory;
-
-        /**
-         * The ID of the file or directory's parent iNode.
-         */
-        public long parentId;
-
-        /**
-         * The number of the serverless function to which the file or directory was mapped.
-         */
-        public int mappedFunctionNumber;
-
-        public ServerlessFunctionMapping(String fileOrDirectory, long parentId, int mappedFunctionNumber) {
-            this.fileOrDirectory = fileOrDirectory;
-            this.parentId = parentId;
-            this.mappedFunctionNumber = mappedFunctionNumber;
-        }
-
-        @Override
-        public String toString() {
-            return "FunctionMapping: [src=" + fileOrDirectory + ", parentId=" + parentId
-                    + ", targetFunctionNumber=" + mappedFunctionNumber + "]";
-        }
     }
 }

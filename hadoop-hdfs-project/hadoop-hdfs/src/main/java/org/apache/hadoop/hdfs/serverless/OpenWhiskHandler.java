@@ -3,16 +3,15 @@ package org.apache.hadoop.hdfs.serverless;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.mysql.clusterj.ClusterJHelper;
-import io.hops.metrics.TransactionEvent;
-import io.hops.transaction.handler.HopsTransactionalRequestHandler;
 import org.apache.commons.lang3.time.DurationFormatUtils;
 import org.apache.hadoop.hdfs.server.namenode.INode;
 import org.apache.hadoop.hdfs.server.namenode.ServerlessNameNode;
 import org.apache.hadoop.hdfs.serverless.operation.ConsistencyProtocol;
-import org.apache.hadoop.hdfs.serverless.operation.execution.DuplicateRequest;
-import org.apache.hadoop.hdfs.serverless.operation.execution.FileSystemTask;
-import org.apache.hadoop.hdfs.serverless.operation.execution.NameNodeResult;
-import org.apache.hadoop.hdfs.serverless.tcpserver.NameNodeTCPClient;
+import org.apache.hadoop.hdfs.serverless.operation.execution.taskarguments.JsonTaskArguments;
+import org.apache.hadoop.hdfs.serverless.operation.execution.taskarguments.TaskArguments;
+import org.apache.hadoop.hdfs.serverless.operation.execution.results.NameNodeResult;
+import org.apache.hadoop.hdfs.serverless.operation.execution.results.NameNodeResultWithMetrics;
+import org.apache.hadoop.hdfs.serverless.tcpserver.NameNodeTcpUdpClient;
 import org.apache.hadoop.hdfs.serverless.tcpserver.ServerlessHopsFSClient;
 import org.apache.log4j.Level;
 import org.apache.log4j.LogManager;
@@ -20,12 +19,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.io.Serializable;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.apache.hadoop.hdfs.serverless.ServerlessNameNodeKeys.*;
@@ -48,7 +43,7 @@ public class OpenWhiskHandler extends BaseHandler {
      */
     private static boolean isCold = true;
 
-    public static AtomicInteger activeRequestCounter = new AtomicInteger(0);
+    //public static AtomicInteger activeRequestCounter = new AtomicInteger(0);
 
     static {
         System.setProperty("sun.io.serialization.extendedDebugInfo", "true");
@@ -58,21 +53,20 @@ public class OpenWhiskHandler extends BaseHandler {
      * OpenWhisk handler.
      */
     public static JsonObject main(JsonObject args) {
-        long startTime = System.nanoTime();
+        long startTime = System.currentTimeMillis();
         String functionName = platformSpecificInitialization();
 
         LOG.info("============================================================");
         LOG.info(functionName + " v" + ServerlessNameNode.versionNumber + " received HTTP request.");
-        int activeRequests = activeRequestCounter.incrementAndGet();
-        LOG.info("Active HTTP requests: " + activeRequests);
+        //int activeRequests = activeRequestCounter.incrementAndGet();
+        //LOG.info("Active HTTP requests: " + activeRequests);
         LOG.info("============================================================\n");
 
-        boolean localMode = false;
         int actionMemory;
         JsonObject userArguments;
         if (args.has("LOCAL_MODE")) {
             LOG.debug("LOCAL MODE IS ENABLED.");
-            localMode = true;
+            localModeEnabled = true;
 
             // In this case, the top-level arguments are in-fact the user arguments.
             userArguments = args;
@@ -91,6 +85,8 @@ public class OpenWhiskHandler extends BaseHandler {
         String clientIpAddress = userArguments.getAsJsonPrimitive(ServerlessNameNodeKeys.CLIENT_INTERNAL_IP).getAsString();
 
         boolean tcpEnabled = userArguments.getAsJsonPrimitive(ServerlessNameNodeKeys.TCP_ENABLED).getAsBoolean();
+        boolean udpEnabled = userArguments.getAsJsonPrimitive(ServerlessNameNodeKeys.UDP_ENABLED).getAsBoolean();
+        boolean benchmarkModeEnabled = userArguments.getAsJsonPrimitive(BENCHMARK_MODE).getAsBoolean();
 
         Instant start = Instant.now();
 
@@ -156,10 +152,10 @@ public class OpenWhiskHandler extends BaseHandler {
         JsonObject fsArgs = userArguments.getAsJsonObject(ServerlessNameNodeKeys.FILE_SYSTEM_OP_ARGS);
         
         if (userArguments.has(LOG_LEVEL)) {
-            String logLevel = userArguments.get(LOG_LEVEL).getAsString();
+            int logLevel = userArguments.get(LOG_LEVEL).getAsInt();
             // LOG.debug("Setting log4j log level to: " + logLevel + ".");
 
-            LogManager.getRootLogger().setLevel(getLogLevelFromString(logLevel));
+            LogManager.getRootLogger().setLevel(getLogLevelFromInteger(logLevel));
         }
 
         if (userArguments.has(CONSISTENCY_PROTOCOL_ENABLED)) {
@@ -171,6 +167,10 @@ public class OpenWhiskHandler extends BaseHandler {
         int tcpPort = -1;
         if (userArguments.has(ServerlessNameNodeKeys.TCP_PORT))
             tcpPort = userArguments.getAsJsonPrimitive(ServerlessNameNodeKeys.TCP_PORT).getAsInt();
+
+        int udpPort = -1;
+        if (userArguments.has(ServerlessNameNodeKeys.UDP_PORT))
+            udpPort = userArguments.getAsJsonPrimitive(ServerlessNameNodeKeys.UDP_PORT).getAsInt();
 
         // Flag that indicates whether this action was invoked by a client or a DataNode.
         boolean isClientInvoker = userArguments.getAsJsonPrimitive(
@@ -185,8 +185,12 @@ public class OpenWhiskHandler extends BaseHandler {
             LOG.info("- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -");
             LOG.debug("Top-level OpenWhisk arguments: " + args);
             LOG.debug("User-passed OpenWhisk arguments: " + userArguments);
+            LOG.debug("Benchmarking Mode: " + (benchmarkModeEnabled ? "ENABLED" : "DISABLED"));
+            LOG.debug((tcpEnabled ? "TCP Enabled." : "TCP Disabled."));
+            LOG.debug(udpEnabled ? "UDP Enabled." : "UDP Disabled.");
+            LOG.debug("TCP Port: " + tcpPort + ", UDP Port: " + udpPort);
             LOG.debug("Action memory: " + actionMemory + "MB");
-            LOG.debug("Local mode: " + (localMode ? "ENABLED" : "DISABLED"));
+            LOG.debug("Local mode: " + (localModeEnabled ? "ENABLED" : "DISABLED"));
             LOG.debug("Client's name: " + clientName);
             LOG.debug("Client IP address: " + (clientIpAddress == null ? "N/A" : clientIpAddress));
             LOG.debug("Invoked by: " + invokerIdentity);
@@ -198,22 +202,18 @@ public class OpenWhiskHandler extends BaseHandler {
 
         // Execute the desired operation. Capture the result to be packaged and returned to the user.
         NameNodeResult result = driver(operation, fsArgs, commandLineArguments, functionName, clientIpAddress,
-                requestId, clientName, isClientInvoker, tcpEnabled, tcpPort, actionMemory, localMode, startTime);
-
-        // isCold is still equal to its original value here, which would be 'true' if this was in fact a cold start.
-        result.setColdStart(isCold);
+                requestId, clientName, isClientInvoker, tcpEnabled, udpEnabled, tcpPort, udpPort, actionMemory,
+                startTime, benchmarkModeEnabled);
 
         // Set the `isCold` flag to false given this is now a warm container.
         isCold = false;
 
-        long endTime = System.nanoTime();
-        double timeElapsed = (endTime - startTime) / 1000000.0;
-
         if (LOG.isDebugEnabled()) {
-            LOG.debug("Returning back to client. Time elapsed: " + timeElapsed + " milliseconds.");
+            long endTime = System.currentTimeMillis();
+            LOG.debug("Returning back to client. Time elapsed: " + (endTime - startTime) + " milliseconds.");
             LOG.debug("ServerlessNameNode is exiting now...");
         }
-        activeRequestCounter.decrementAndGet();
+        //activeRequestCounter.decrementAndGet();
         return createJsonResponse(result);
     }
 
@@ -266,11 +266,20 @@ public class OpenWhiskHandler extends BaseHandler {
      * @return Result of executing NameNode code/operation/function execution.
      */
     private static NameNodeResult driver(String op, JsonObject fsArgs, String[] commandLineArguments,
-                                     String functionName, String clientIPAddress, String requestId,
-                                     String clientName, boolean isClientInvoker, boolean tcpEnabled,
-                                     int tcpPort, int actionMemory, boolean localMode, long startTime) {
-        NameNodeResult result = new NameNodeResult(ServerlessNameNode.getFunctionNumberFromFunctionName(functionName),
-                requestId, "HTTP", -1, op);
+                                         String functionName, String clientIPAddress, String requestId,
+                                         String clientName, boolean isClientInvoker, boolean tcpEnabled,
+                                         boolean udpEnabled, int tcpPort, int udpPort, int actionMemory,
+                                         long startTime, boolean benchmarkModeEnabled) {
+        NameNodeResult result;
+
+        if (benchmarkModeEnabled) {
+            LOG.debug("Creating instance of NameNodeResult (i.e., NO metrics).");
+            result = new NameNodeResult(requestId, op);
+        } else {
+            LOG.debug("Creating instance of NameNodeResultWithMetrics.");
+            result = new NameNodeResultWithMetrics(ServerlessNameNode.getFunctionNumberFromFunctionName(functionName),
+                    requestId, "HTTP", -1, op);
+        }
 
         if (LOG.isDebugEnabled()) LOG.debug("======== Getting or Creating Serverless NameNode Instance ========");
 
@@ -280,7 +289,7 @@ public class OpenWhiskHandler extends BaseHandler {
         ServerlessNameNode serverlessNameNode;
         try {
             serverlessNameNode = ServerlessNameNode.getOrCreateNameNodeInstance(commandLineArguments, functionName,
-                    actionMemory, localMode, isCold);
+                    actionMemory, isCold);
         }
         catch (Exception ex) {
             LOG.error("Encountered " + ex.getClass().getSimpleName()
@@ -291,49 +300,31 @@ public class OpenWhiskHandler extends BaseHandler {
 
         long creationEnd = System.currentTimeMillis();
         long creationDuration = creationEnd - creationStart;
-        if (LOG.isDebugEnabled()) LOG.debug("Obtained NameNode instance with ID=" + serverlessNameNode.getId());
-        result.setNameNodeId(serverlessNameNode.getId());
-        if (LOG.isDebugEnabled()) LOG.debug("Getting/creating NN instance took: " + DurationFormatUtils.formatDurationHMS(creationDuration));
 
-        // Some transactions are performed while creating the NameNode. Obviously the NameNode does not exist until
-        // it is finished being created, so we store the TransactionEvent instances from those transactions in the
-        // temporaryEventsSet variable. So, we just check here if it is not null. If not, then we add the events
-        // to the NameNode (that was presumably just created). Then we clear the list.
-//        Set<TransactionEvent> tempEvents = temporaryEventSet.get();
-//        if (tempEvents != null) {
-//            serverlessNameNode.addTransactionEvents(tempEvents);
-//            tempEvents.clear();
-//        }
-
-        // Check for duplicate requests. If the request is NOT a duplicate, then have the NameNode check for updates
-        // from intermediate storage.
-        if (LOG.isDebugEnabled())LOG.debug("==================================================================");
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Obtained NameNode instance with ID=" + serverlessNameNode.getId());
+            LOG.debug("Getting/creating NN instance took: " + DurationFormatUtils.formatDurationHMS(creationDuration));
+            LOG.debug("==================================================================");
+        }
 
         // Check if we need to redo this operation. This can occur if the TCP connection that was supposed
         // to deliver the result back to the client was dropped before the client received the result.
         boolean redoEvenIfDuplicate = fsArgs.has(FORCE_REDO) && fsArgs.get(FORCE_REDO).getAsBoolean();
 
-        // Check to see if this is a duplicate request, in which case we should return a message indicating as such.
-        if (!redoEvenIfDuplicate && serverlessNameNode.checkIfRequestProcessedAlready(requestId)) {
-            LOG.warn("This request (" + requestId + ") has already been received. Exiting now...");
-            result.addResult(new DuplicateRequest("HTTP", requestId), true);
-            return result;
-        } else if (redoEvenIfDuplicate) {
-            LOG.warn("Apparently, request " + requestId + " must be re-executed...");
-        }
-
         // Finally, create a new task and assign it to the worker thread.
         // After this, we will simply wait for the result to be completed before returning it to the user.
         // FileSystemTask<Serializable> task = new FileSystemTask<>(requestId, op, fsArgs, redoEvenIfDuplicate, "HTTP");
-
-        result.setFnStartTime(startTime);
 
         currentRequestId.set(requestId);
 
         // Wait for the worker thread to execute the task. We'll return the result (if there is one) to the client.
         try {
-            serverlessNameNode.getExecutionManager().tryExecuteTask(
-                    requestId, op, fsArgs, redoEvenIfDuplicate, result, true);
+            if (result instanceof NameNodeResultWithMetrics)
+                serverlessNameNode.getExecutionManager().tryExecuteTask(
+                        requestId, op, new JsonTaskArguments(fsArgs), redoEvenIfDuplicate, (NameNodeResultWithMetrics)result, true);
+            else
+                serverlessNameNode.getExecutionManager().tryExecuteTask(
+                        requestId, op, new JsonTaskArguments(fsArgs), redoEvenIfDuplicate, result, true);
         } catch (Exception ex) {
             LOG.error("Encountered " + ex.getClass().getSimpleName() + " while waiting for task " + requestId
                     + " to be executed by the worker thread: ", ex);
@@ -343,13 +334,14 @@ public class OpenWhiskHandler extends BaseHandler {
         // The last step is to establish a TCP connection to the client that invoked us.
         if (isClientInvoker && tcpEnabled) {
             ServerlessHopsFSClient serverlessHopsFSClient = new ServerlessHopsFSClient(
-                    clientName, clientIPAddress, tcpPort);
+                    clientName, clientIPAddress, tcpPort, udpPort, udpEnabled);
 
-            final NameNodeTCPClient tcpClient = serverlessNameNode.getNameNodeTcpClient();
+            final NameNodeTcpUdpClient tcpClient = serverlessNameNode.getNameNodeTcpClient();
             // Do this in a separate thread so that we can return the result back to the user immediately.
             new Thread(() -> {
                 try {
-                    if (LOG.isDebugEnabled())LOG.debug("Attempting to connect to client " + serverlessHopsFSClient + " in separate thread.");
+                    if (LOG.isDebugEnabled())LOG.debug("Attempting to connect to client " + serverlessHopsFSClient +
+                            " in separate thread.");
                     tcpClient.addClient(serverlessHopsFSClient);
                 } catch (IOException ex) {
                     LOG.error("Encountered exception while connecting to client " + serverlessHopsFSClient + ":", ex);
@@ -357,7 +349,14 @@ public class OpenWhiskHandler extends BaseHandler {
             }).start();
         }
 
-        result.logResultDebugInformation(op);
+        if (!benchmarkModeEnabled) {
+            NameNodeResultWithMetrics resultWithMetrics = (NameNodeResultWithMetrics)result;
+            // isCold is still equal to its original value here, which would be 'true' if this was in fact a cold start.
+            resultWithMetrics.setColdStart(isCold);
+            resultWithMetrics.setFnStartTime(startTime);
+            resultWithMetrics.setNameNodeId(serverlessNameNode.getId());
+            resultWithMetrics.logResultDebugInformation(op);
+        }
         return result;
     }
 
@@ -381,6 +380,46 @@ public class OpenWhiskHandler extends BaseHandler {
        return Level.DEBUG;
     }
 
+    public static org.apache.log4j.Level getLogLevelFromInteger(int level) {
+        if (level == 0)
+            return Level.INFO;
+        else if (level == 1)
+            return Level.DEBUG;
+        else if (level == 2)
+            return Level.WARN;
+        else if (level == 3)
+            return Level.ERROR;
+        else if (level == 4)
+            return Level.TRACE;
+        else if (level == 5)
+            return Level.FATAL;
+        else if (level == 6)
+            return Level.ALL;
+
+        LOG.error("Unknown log level specified: '" + level + "'. Defaulting to 'debug'.");
+        return Level.DEBUG;
+    }
+
+    public static int getLogLevelIntFromString(String level) {
+        if (level.equalsIgnoreCase("info"))
+            return 0;
+        else if (level.equalsIgnoreCase("debug"))
+            return 1;
+        else if (level.equalsIgnoreCase("warn"))
+            return 2;
+        else if (level.equalsIgnoreCase("error"))
+            return 3;
+        else if (level.equalsIgnoreCase("trace"))
+            return 4;
+        else if (level.equalsIgnoreCase("fatal"))
+            return 5;
+        else if (level.equalsIgnoreCase("all"))
+            return 6;
+
+        LOG.error("Unknown log level specified: '" + level + "'. Defaulting to 'debug'.");
+        return 1;
+    }
+
     /**
      * Check if there is a single target file/directory specified within the file system arguments passed by the client.
      * If there is, then we will create a function mapping for the client, so they know which NameNode is responsible
@@ -390,14 +429,15 @@ public class OpenWhiskHandler extends BaseHandler {
      * @param serverlessNameNode The current serverless name node instance, as we need this to determine the mapping.
      */
     public static void tryCreateDeploymentMapping(NameNodeResult result,
-                                                  JsonObject fsArgs,
+                                                  TaskArguments fsArgs,
                                                   ServerlessNameNode serverlessNameNode)
             throws IOException {
         // After performing the desired FS operation, we check if there is a particular file or directory
         // identified by the `src` parameter. This is the file/directory that should be hashed to a particular
         // serverless function. We calculate this here and include the information for the client in our response.
-        if (fsArgs != null && fsArgs.has(ServerlessNameNodeKeys.SRC)) {
-            String src = fsArgs.getAsJsonPrimitive(ServerlessNameNodeKeys.SRC).getAsString();
+        if (fsArgs != null && fsArgs.contains(ServerlessNameNodeKeys.SRC)) {
+            //String src = fsArgs.getAsJsonPrimitive(ServerlessNameNodeKeys.SRC).getAsString();
+            String src = fsArgs.getString(SRC);
 
             INode inode = null;
             try {
@@ -430,7 +470,7 @@ public class OpenWhiskHandler extends BaseHandler {
      * @return JsonObject to return as result of this OpenWhisk activation (i.e., serverless function execution).
      */
     private static JsonObject createJsonResponse(NameNodeResult result) {
-        JsonObject resultJson = result.toJson(null, ServerlessNameNode.
+        JsonObject resultJson = result.toJson(ServerlessNameNode.
                 tryGetNameNodeInstance(true).getNamesystem().getMetadataCacheManager());
 
         JsonObject response = new JsonObject();

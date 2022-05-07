@@ -768,11 +768,6 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean, NameNodeMXBe
       leaseManager.startMonitor();
       startSecretManagerIfNecessary();
 
-      LOG.warn("NOT starting ResourceMonitor thread.");
-      //ResourceMonitor required only at ActiveNN. See HDFS-2914
-      // this.nnrmthread = new Daemon(new NameNodeResourceMonitor());
-      // nnrmthread.start();
-
       if(isRetryCacheEnabled) {
         this.retryCacheCleanerThread = new Daemon(new RetryCacheCleaner());
         this.retryCacheCleanerThread.setName("Retry Cache Cleaner");
@@ -787,6 +782,8 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean, NameNodeMXBe
         cacheManager.startMonitorThread();
       }
 
+      LOG.debug("Creating ZooKeeper invalidation listener for '/" + serverlessNameNode.getFunctionName() + "/'");
+
       // Add ZooKeeper-based invalidation listener.
       serverlessNameNode.getZooKeeperClient().addInvalidationListener(serverlessNameNode.getFunctionName(), watchedEvent -> {
         // If the ZNode's children changed,
@@ -800,6 +797,8 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean, NameNodeMXBe
           }
         }
       });
+
+      LOG.debug("Added ZooKeeper invalidation listener for '/" + serverlessNameNode.getFunctionName() + "/'");
 
     } finally {
       startingActiveService = false;
@@ -1016,7 +1015,19 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean, NameNodeMXBe
    *             serialized {@link ZooKeeperInvalidation} object contained within.
    */
   private void invalidationReceivedFromZooKeeper(String path) throws Exception {
-    ZooKeeperInvalidation invalidation = serverlessNameNode.getZooKeeperClient().getInvalidation(path);
+    ZooKeeperInvalidation invalidation;
+    try {
+      long s = System.nanoTime();
+      invalidation = serverlessNameNode.getZooKeeperClient().getInvalidation(path);
+      if (LOG.isDebugEnabled()) {
+        long t = System.nanoTime();
+        LOG.debug("Retrieved INV '" + path + "' from ZK in " + ((t - s) / 1.0e6) + " ms.");
+      }
+    } catch (Exception ex) {
+      LOG.warn("Failed to retrieve invalidation for path '" + path + "'. Perhaps an old invalidation was deleted?");
+      LOG.warn(ex);
+      return;
+    }
 
     long localNameNodeId = serverlessNameNode.getId();
 
@@ -1036,14 +1047,15 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean, NameNodeMXBe
     }
 
     // TODO: Add support for subtree operations.
-    serverlessNameNode.getZooKeeperClient().acknowledge(path, localNameNodeId);
+    // TODO: Was the above TODO just referring to being able to invalidate by prefix? If so, then that's done.
+    // serverlessNameNode.getZooKeeperClient().acknowledge(path, localNameNodeId);
+    serverlessNameNode.getZooKeeperClient().acknowledge(
+            serverlessNameNode.getDeploymentNumber(), operationId, localNameNodeId);
     if (isSubtreeInvalidation) {
-      // metadataCache.invalidateKeysByPrefix(subtreeRoot);
       metadataCacheManager.invalidateINodesByPrefix(subtreeRoot);
     } else {
       for (long id : invalidatedINodes) {
         LOG.debug("Attempting to invalidate INode " + id + " (if we have it cached).");
-        // metadataCache.invalidateKey(id);
         metadataCacheManager.invalidateINode(id);
       }
     }

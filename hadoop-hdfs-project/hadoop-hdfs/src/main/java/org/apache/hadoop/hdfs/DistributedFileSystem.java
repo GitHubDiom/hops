@@ -189,6 +189,10 @@ public class DistributedFileSystem extends FileSystem {
     this.dfs.addOperationPerformeds(operationPerformeds);
   }
 
+  public void addOperationPerformeds(OperationPerformed[] operationPerformeds) {
+    this.dfs.addOperationPerformeds(operationPerformeds);
+  }
+
   // Added for debugging serverless NN.
   public void printOperationsPerformed() {
     this.dfs.printOperationsPerformed();
@@ -199,7 +203,10 @@ public class DistributedFileSystem extends FileSystem {
     this.dfs.printDebugInformation();
   }
 
-  
+  public void setBenchmarkModeEnabled(boolean benchmarkModeEnabled) {
+    dfs.setBenchmarkModeEnabled(benchmarkModeEnabled);
+  }
+
   @Override
   public void initialize(URI uri, Configuration conf) throws IOException {
     super.initialize(uri, conf);

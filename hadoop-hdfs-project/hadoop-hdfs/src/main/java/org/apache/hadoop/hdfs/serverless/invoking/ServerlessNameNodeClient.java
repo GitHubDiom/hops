@@ -29,10 +29,15 @@ import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifie
 import org.apache.hadoop.hdfs.server.namenode.SafeModeException;
 import org.apache.hadoop.hdfs.server.namenode.ServerlessNameNode;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeStorageReport;
+import org.apache.hadoop.hdfs.serverless.OpenWhiskHandler;
 import org.apache.hadoop.hdfs.serverless.ServerlessNameNodeKeys;
 import io.hops.metrics.OperationPerformed;
-import org.apache.hadoop.hdfs.serverless.operation.execution.NameNodeResult;
+import org.apache.hadoop.hdfs.serverless.operation.execution.results.NameNodeResult;
+import org.apache.hadoop.hdfs.serverless.operation.execution.results.NameNodeResultWithMetrics;
+import org.apache.hadoop.hdfs.serverless.operation.execution.results.ServerlessFunctionMapping;
 import org.apache.hadoop.hdfs.serverless.tcpserver.HopsFSUserServer;
+import org.apache.hadoop.hdfs.serverless.tcpserver.TcpRequestPayload;
+import org.apache.hadoop.hdfs.serverless.tcpserver.TcpTaskFuture;
 import org.apache.hadoop.io.DataOutputBuffer;
 import org.apache.hadoop.io.EnumSetWritable;
 import org.apache.hadoop.io.ObjectWritable;
@@ -95,12 +100,9 @@ public class ServerlessNameNodeClient implements ClientProtocol {
     private final boolean tcpEnabled;
 
     /**
-     * The server port defaults to whatever is specified in the configuration. But if multiple threads are used,
-     * then conflicts will arise. So, the threads will try using different ports until one works (incrementing
-     * the one specified in configuration until one works). We communicate this port to NameNodes in the invocation
-     * payload so that they know how to connect to us.
+     * Not really used by this class. Just used for debugging.
      */
-    private int tcpServerPort;
+    private final boolean udpEnabled;
 
     /**
      * Indicates whether we're being executed in a local container for testing/profiling/debugging purposes.
@@ -143,25 +145,25 @@ public class ServerlessNameNodeClient implements ClientProtocol {
      */
     private final HashMap<String, OperationPerformed> operationsPerformed = new HashMap<>();
 
-    /**
-     * The number of operations we've issued to a NameNode.
-     * This includes both successful and failed operations.
-     * This does not count individual retries for HTTP, as those are handled by the invoker implementation.
-     */
-    private int numOperationsIssued = 0;
-
-    /**
-     * The number of operations we've issued to a NameNode via HTTP.
-     * This includes both successful and failed operations.
-     * This does not count individual retries, as those are handled by the invoker implementation.
-     */
-    private int numOperationsIssuedViaHttp = 0;
-
-    /**
-     * The number of operations we've issued to a NameNode via TCP.
-     * This includes both successful and failed operations.
-     */
-    private int numOperationsIssuedViaTcp = 0;
+//    /**
+//     * The number of operations we've issued to a NameNode.
+//     * This includes both successful and failed operations.
+//     * This does not count individual retries for HTTP, as those are handled by the invoker implementation.
+//     */
+//    private int numOperationsIssued = 0;
+//
+//    /**
+//     * The number of operations we've issued to a NameNode via HTTP.
+//     * This includes both successful and failed operations.
+//     * This does not count individual retries, as those are handled by the invoker implementation.
+//     */
+//    private int numOperationsIssuedViaHttp = 0;
+//
+//    /**
+//     * The number of operations we've issued to a NameNode via TCP.
+//     * This includes both successful and failed operations.
+//     */
+//    private int numOperationsIssuedViaTcp = 0;
 
     /**
      * Threshold at which we stop targeting specific deployments in an effort to prevent additional pods
@@ -215,15 +217,21 @@ public class ServerlessNameNodeClient implements ClientProtocol {
      * Minimum length of timeout when using straggler mitigation. If it is too short, then we'll thrash (responses
      * will come back but only after we've prematurely timed out, and this will turn into a cycle). There is a
      * mechanism in-place to prevent this thrashing (the TCP server holds onto results it receives that do not have
-     * an associated {@link org.apache.hadoop.hdfs.serverless.tcpserver.RequestResponseFuture}, but still.
+     * an associated {@link TcpTaskFuture}, but still.
      */
     protected int minimumStragglerMitigationTimeout;
+
+    /**
+     * Turns off metric collection to save time, network transfer, and memory.
+     */
+    protected boolean benchmarkModeEnabled = false;
 
     public ServerlessNameNodeClient(Configuration conf, DFSClient dfsClient) throws IOException {
         // "https://127.0.0.1:443/api/v1/web/whisk.system/default/namenode?blocking=true";
         serverlessEndpointBase = dfsClient.serverlessEndpoint;
         serverlessPlatformName = conf.get(SERVERLESS_PLATFORM, SERVERLESS_PLATFORM_DEFAULT);
         tcpEnabled = conf.getBoolean(SERVERLESS_TCP_REQUESTS_ENABLED, SERVERLESS_TCP_REQUESTS_ENABLED_DEFAULT);
+        udpEnabled = conf.getBoolean(SERVERLESS_USE_UDP, SERVERLESS_USE_UDP_DEFAULT);
         localMode = conf.getBoolean(SERVERLESS_LOCAL_MODE, SERVERLESS_LOCAL_MODE_DEFAULT);
         latencyThreshold = conf.getDouble(SERVERLESS_LATENCY_THRESHOLD, SERVERLESS_LATENCY_THRESHOLD_DEFAULT);
         latencyWindowSize = conf.getInt(SERVERLESS_LATENCY_WINDOW_SIZE, SERVERLESS_LATENCY_WINDOW_SIZE_DEFAULT);
@@ -246,6 +254,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         LOG.info("Serverless endpoint: " + serverlessEndpointBase);
         LOG.info("Serverless platform: " + serverlessPlatformName);
         LOG.info("TCP requests are " + (tcpEnabled ? "enabled." : "disabled."));
+        LOG.info("UDP requests are " + (udpEnabled ? "enabled." : "disabled."));
         LOG.debug("Straggler mitigation is " + (stragglerMitigationEnabled ? " enabled. " +
                 "Straggler mitigation factor: " + stragglerMitigationThresholdFactor + "." : "disabled."));
         LOG.debug("Latency Window: " + latencyWindowSize + ", Latency Threshold: " + latencyThreshold + " ms.");
@@ -268,6 +277,11 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         this.latencyWithWindow = new DescriptiveStatistics(latencyWindowSize);
     }
 
+    public void setBenchmarkModeEnabled(boolean benchmarkModeEnabled) {
+        this.benchmarkModeEnabled = benchmarkModeEnabled;
+        this.serverlessInvoker.benchmarkModeEnabled = benchmarkModeEnabled;
+    }
+
     /**
      * Extract the result from the NN.
      *
@@ -281,7 +295,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         if (resultPayload instanceof NameNodeResult) {
             NameNodeResult result = (NameNodeResult)resultPayload;
 
-            NameNodeResult.ServerlessFunctionMapping functionMapping = result.getServerlessFunctionMapping();
+            ServerlessFunctionMapping functionMapping = result.getServerlessFunctionMapping();
 
             if (functionMapping != null) {
                 serverlessInvoker.cache.addEntry(
@@ -293,17 +307,20 @@ public class ServerlessNameNodeClient implements ClientProtocol {
             ArrayList<Throwable> exceptions = result.getExceptions();
             if (exceptions != null && exceptions.size() > 0) {
                 LOG.warn("=+=+==+=+==+=+==+=+==+=+==+=+==+=+==+=+==+=+==+=+==+=");
-                LOG.warn("*** The ServerlessNameNode encountered " + exceptions.size() +
-                        (exceptions.size() == 1 ? " exception. ***" : " exceptions. ***"));
+                LOG.warn("The ServerlessNameNode encountered " + exceptions.size() +
+                        (exceptions.size() == 1 ? " exception." : " exceptions."));
 
                 for (Throwable t : exceptions)
                     LOG.error(t);
                 LOG.warn("=+=+==+=+==+=+==+=+==+=+==+=+==+=+==+=+==+=+==+=+==+=");
             }
 
-            List<TransactionEvent> txEvents = result.getTxEvents();
-            if (txEvents != null) {
-                this.serverlessInvoker.transactionEvents.put(result.getRequestId(), txEvents);
+            if (!benchmarkModeEnabled) {
+                NameNodeResultWithMetrics nameNodeResultWithMetrics = (NameNodeResultWithMetrics)result;
+                List<TransactionEvent> txEvents = nameNodeResultWithMetrics.getTxEvents();
+                if (txEvents != null) {
+                    this.serverlessInvoker.transactionEvents.put(nameNodeResultWithMetrics.getRequestId(), txEvents);
+                }
             }
 
             return result.getResult();
@@ -361,7 +378,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
      * @param tcpLatencies Latencies from TCP requests.
      * @param httpLatencies Latencies from HTTP requests.
      */
-    public void addLatencies(Collection<Double> tcpLatencies, Collection<Double>  httpLatencies) {
+    public void addLatencies(Collection<Double> tcpLatencies, Collection<Double> httpLatencies) {
         for (double tcpLatency : tcpLatencies) {
             latencyTcp.addValue(tcpLatency);
             latency.addValue(tcpLatency);
@@ -470,12 +487,10 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         long opStart = System.currentTimeMillis();
         String requestId = UUID.randomUUID().toString();
 
-        JsonObject payload = new JsonObject();
-        payload.addProperty(ServerlessNameNodeKeys.REQUEST_ID, requestId);
-        payload.addProperty(ServerlessNameNodeKeys.OPERATION, operationName);
-        payload.addProperty(CONSISTENCY_PROTOCOL_ENABLED, consistencyProtocolEnabled);
-        payload.addProperty(LOG_LEVEL, serverlessFunctionLogLevel);
-        payload.add(ServerlessNameNodeKeys.FILE_SYSTEM_OP_ARGS, opArguments.convertToJsonObject());
+        // This contains the file system operation arguments (and everything else) that will be submitted to the NN.
+        TcpRequestPayload tcpRequestPayload = new TcpRequestPayload(requestId, operationName,
+                consistencyProtocolEnabled, OpenWhiskHandler.getLogLevelIntFromString(serverlessFunctionLogLevel),
+                opArguments.getAllArguments(), benchmarkModeEnabled);
 
         boolean stragglerResubmissionAlreadyOccurred = false;
         boolean wasResubmittedViaStragglerMitigation = false;
@@ -497,38 +512,38 @@ public class ServerlessNameNodeClient implements ClientProtocol {
                 localStart = System.currentTimeMillis();
 
                 if (LOG.isDebugEnabled()) {
-                    LOG.debug("Issuing TCP request for operation '" + operationName + "' now. Request ID = '" +
-                            requestId + "'. Attempt " + exponentialBackOff.getNumberOfRetries() +
-                                    (stragglerResubmissionAlreadyOccurred ? "*" : "") + "/" + maxRetries +
+                    LOG.debug("Issuing " + (tcpServer.isUdpEnabled() ? "UDP" : "TCP") +
+                            " request for operation '" + operationName + "' now. Request ID = '" +
+                            requestId + "'. Attempt " + exponentialBackOff.getNumberOfRetries() + "/" + maxRetries +
+                            ".");
+                } else if (LOG.isTraceEnabled()) {
+                    LOG.trace("Issuing " + (tcpServer.isUdpEnabled() ? "UDP" : "TCP") + " request for operation '" +
+                            operationName + "' now. Request ID = '" + requestId + "'. Attempt " +
+                            exponentialBackOff.getNumberOfRetries() +
+                            (stragglerResubmissionAlreadyOccurred ? "*" : "") + "/" + maxRetries +
                             ". Time elapsed so far: " + (System.currentTimeMillis() - opStart) + " ms. Timeout: " +
                             requestTimeout + " ms. " + (stragglerResubmissionAlreadyOccurred ?
                             "Straggler resubmission has already occurred." :
                             "Straggler resubmission has NOT already occurred."));
                 }
-                numOperationsIssuedViaTcp++;
-                numOperationsIssued++;
-                Object response = tcpServer.issueTcpRequestAndWait(targetDeployment, false, payload,
-                        requestTimeout, !stragglerResubmissionAlreadyOccurred);
 
-                if (response instanceof JsonObject) {
-                    JsonObject responseJson = (JsonObject)response;
+//                numOperationsIssuedViaTcp++;
+//                numOperationsIssued++;
+                Object response = tcpServer.issueTcpRequestAndWait(targetDeployment, false, requestId,
+                        operationName, tcpRequestPayload, requestTimeout, !stragglerResubmissionAlreadyOccurred);
 
-                    // After receiving a response, we need to check if it is a cancellation message or not.
-                    // Cancellation messages are posted by the TCP server if the TCP connection is terminated unexpectedly.
-                    // If we receive a cancellation message, then we need to fall back to HTTP. To do this, we'll just
-                    // throw an IOException here. It will be caught by the 'catch' clause, which will transparently
-                    // fall back to HTTP.
-                    if (responseJson.has(CANCELLED) && responseJson.get(CANCELLED).getAsBoolean()) {
-                        // We add this argument so that the NameNode knows it must redo the operation,
-                        // even though it has potentially seen it before.
-                        opArguments.addPrimitive(FORCE_REDO, true);
+                // This only ever happens when the request is cancelled.
+                if (response instanceof TcpRequestPayload) {
+                    TcpRequestPayload requestPayload = (TcpRequestPayload)response;
 
-                        // Throw the exception. This will be caught, and the request will be resubmitted via HTTP.
-                        throw new IOException("The TCP future for request " + requestId + " (operation = " + operationName +
-                                ") has been cancelled. Reason: " + responseJson.get(REASON).getAsString() + ".");
-                    } else {
-                        throw new IllegalStateException("Received JsonObject from TCP request.");
-                    }
+                    if (!requestPayload.isCancelled())
+                        throw new IllegalStateException("Obtained TcpRequestPayload as response from TCP request '" +
+                                requestId + "', but payload is not marked as cancelled...");
+
+                    opArguments.addPrimitive(FORCE_REDO, true);
+                    // Throw the exception. This will be caught, and the request will be resubmitted via HTTP.
+                    throw new IOException("The TCP future for request " + requestId + " (operation = " + operationName +
+                            ") has been cancelled. Reason: " + requestPayload.getCancellationReason() + ".");
                 }
 
                 NameNodeResult result = (NameNodeResult)response;
@@ -547,7 +562,8 @@ public class ServerlessNameNodeClient implements ClientProtocol {
                                 " is still active, yet we received a 'DUPLICATE REQUEST' notification for it.");
                         LOG.warn("Resubmitting request " + requestId + " with FORCE_REDO...");
 
-                        payload.get(FILE_SYSTEM_OP_ARGS).getAsJsonObject().addProperty(FORCE_REDO, true);
+                        //payload.get(FILE_SYSTEM_OP_ARGS).getAsJsonObject().addProperty(FORCE_REDO, true);
+                        tcpRequestPayload.getFsOperationArguments().put(FORCE_REDO, true);
 
                         // We don't sleep in this case, as there wasn't a time-out exception.
                         continue;
@@ -560,12 +576,12 @@ public class ServerlessNameNodeClient implements ClientProtocol {
 
                 long localEnd = System.currentTimeMillis();
 
-                //addLatency(localEnd - localStart, -1, response.has(COLD_START) && response.get(COLD_START).getAsBoolean());
                 addLatency(localEnd - localStart, -1);
 
-                // Collect and save/record metrics.
-                createAndStoreOperationPerformed(result, operationName, requestId, opStart, localEnd,
-                        true, false, wasResubmittedViaStragglerMitigation);
+                if (!benchmarkModeEnabled)
+                    // Collect and save/record metrics.
+                    createAndStoreOperationPerformed((NameNodeResultWithMetrics)result, operationName, requestId,
+                            localStart, localEnd, true, false, wasResubmittedViaStragglerMitigation);
 
                 return response;
             } catch (TimeoutException ex) {
@@ -575,7 +591,8 @@ public class ServerlessNameNodeClient implements ClientProtocol {
                 // the request, then we'll do so now, and we'll only sleep for a small interval of time.
                 if (stragglerMitigationEnabled) {
                     if (stragglerResubmissionAlreadyOccurred) {
-                        LOG.error("Timed out while waiting for TCP response for request " + requestId + ".");
+                        LOG.error("Timed out while waiting for " + (tcpServer.isUdpEnabled() ? "UDP" : "TCP") +
+                                " response for request " + requestId + ".");
                         LOG.error("Already submitted a straggler mitigation request. Counting this as a 'real' timeout.");
                         stragglerResubmissionAlreadyOccurred = false; // Flip this back to false.
                         // Don't continue. We need to exponentially backoff.
@@ -586,7 +603,8 @@ public class ServerlessNameNodeClient implements ClientProtocol {
 
                         // If this isn't a write operation, then make the NN redo it so that it may go faster.
                         if (!ServerlessNameNode.isWriteOperation(operationName))
-                            payload.get(FILE_SYSTEM_OP_ARGS).getAsJsonObject().addProperty(FORCE_REDO, true);
+                            tcpRequestPayload.getFsOperationArguments().put(FORCE_REDO, true);
+                            // payload.get(FILE_SYSTEM_OP_ARGS).getAsJsonObject().addProperty(FORCE_REDO, true);
                         continue; // Use continue statement to avoid exponential backoff.
                     }
                 } else {
@@ -611,8 +629,8 @@ public class ServerlessNameNodeClient implements ClientProtocol {
 
                 long startTime = System.currentTimeMillis();
 
-                numOperationsIssued++;
-                numOperationsIssuedViaHttp++;
+//                numOperationsIssued++;
+//                numOperationsIssuedViaHttp++;
                 // Issue the HTTP request. This function will handle retries and timeouts.
                 JsonObject response = dfsClient.serverlessInvoker.invokeNameNodeViaHttpPost(
                         operationName,
@@ -629,21 +647,19 @@ public class ServerlessNameNodeClient implements ClientProtocol {
                             operationName + ". Time elapsed: " + (System.currentTimeMillis() - startTime) + " ms.");
 
                 long endTime = System.currentTimeMillis();
-
                 addLatency(-1, endTime - startTime);
-
-                long opEnd = System.currentTimeMillis();
 
                 if (LOG.isDebugEnabled())
                     LOG.debug("Received result from NameNode after falling back to HTTP for operation " +
-                        operationName + ". Time elapsed: " + (opEnd - opStart) + ".");
+                        operationName + ". Time elapsed: " + (endTime - opStart) + ".");
 
                 if (response.has("body"))
                     response = response.get("body").getAsJsonObject();
 
-                // Collect and save/record metrics.
-                createAndStoreOperationPerformed(response, operationName, requestId, opStart, opEnd,
-                        true, true, wasResubmittedViaStragglerMitigation);
+                if (!benchmarkModeEnabled)
+                    // Collect and save/record metrics.
+                    createAndStoreOperationPerformed(response, operationName, requestId, startTime, endTime,
+                            true, true, wasResubmittedViaStragglerMitigation);
 
                 return response;
             }
@@ -675,7 +691,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         Object srcArgument = opArguments.get(ServerlessNameNodeKeys.SRC);
 
         // If tcpEnabled is false, we don't even bother checking to see if we can issue a TCP request.
-        if (tcpEnabled && srcArgument instanceof String) {
+        if (tcpEnabled && srcArgument != null) {
             String sourceFileOrDirectory = (String)srcArgument;
 
             // Next, let's see if we have an entry in our cache for this file/directory.
@@ -706,9 +722,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
             }
             else {
                 if (LOG.isDebugEnabled())
-                    LOG.debug("Source file/directory " + sourceFileOrDirectory + " is mapped to serverless NameNode " +
-                        mappedFunctionNumber + ". TCP connection exists: " +
-                        tcpServer.connectionExists(mappedFunctionNumber));
+                    LOG.debug("Source file/directory " + sourceFileOrDirectory + " is mapped to serverless NameNode " + mappedFunctionNumber + ". TCP connection exists: " + tcpServer.connectionExists(mappedFunctionNumber));
             }
         }
 
@@ -726,8 +740,8 @@ public class ServerlessNameNodeClient implements ClientProtocol {
 
         long startTime = System.currentTimeMillis();
 
-        numOperationsIssued++;
-        numOperationsIssuedViaHttp++;
+//        numOperationsIssued++;
+//        numOperationsIssuedViaHttp++;
         // If there is no "source" file/directory argument, or if there was no existing mapping for the given source
         // file/directory, then we'll just use an HTTP request.
         JsonObject response = dfsClient.serverlessInvoker.invokeNameNodeViaHttpPost(
@@ -744,17 +758,17 @@ public class ServerlessNameNodeClient implements ClientProtocol {
 
         long endTime = System.currentTimeMillis();
 
-        //addLatency(-1, endTime - startTime, response.has(COLD_START) && response.get(COLD_START).getAsBoolean());
         addLatency(-1, endTime - startTime);
 
         if (LOG.isDebugEnabled())
-            LOG.debug("Response: " + response.toString());
+            LOG.debug("Response: " + response);
 
         if (response.has("body"))
             response = response.get("body").getAsJsonObject();
 
-        createAndStoreOperationPerformed(response, operationName, requestId, startTime, endTime,
-                false, true, false);
+        if (!benchmarkModeEnabled)
+            createAndStoreOperationPerformed(response, operationName, requestId, startTime, endTime,
+                    false, true, false);
 
         return response;
     }
@@ -773,31 +787,37 @@ public class ServerlessNameNodeClient implements ClientProtocol {
     private void createAndStoreOperationPerformed(JsonObject response, String operationName, String requestId,
                                                   long startTime, long endTime, boolean issuedViaTCP,
                                                   boolean issuedViaHTTP, boolean wasResubmittedViaStragglerMitigation) {
+        if (benchmarkModeEnabled)
+            return;
+
         try {
             long nameNodeId = -1;
-            if (response.has(ServerlessNameNodeKeys.NAME_NODE_ID))
-                nameNodeId = response.get(ServerlessNameNodeKeys.NAME_NODE_ID).getAsLong();
+            if (response.has(NAME_NODE_ID))
+                nameNodeId = response.get(NAME_NODE_ID).getAsLong();
 
             int deployment = -1;
-            if (response.has(ServerlessNameNodeKeys.DEPLOYMENT_NUMBER))
-                deployment = response.get(ServerlessNameNodeKeys.DEPLOYMENT_NUMBER).getAsInt();
+            if (response.has(DEPLOYMENT_NUMBER))
+                deployment = response.get(DEPLOYMENT_NUMBER).getAsInt();
 
-            int cacheHits = response.get(ServerlessNameNodeKeys.CACHE_HITS).getAsInt();
-            int cacheMisses = response.get(ServerlessNameNodeKeys.CACHE_MISSES).getAsInt();
+            int cacheHits = response.get(CACHE_HITS).getAsInt();
+            int cacheMisses = response.get(CACHE_MISSES).getAsInt();
 
-            long fnStartTime = response.get(ServerlessNameNodeKeys.FN_START_TIME).getAsLong();
-            long fnEndTime = response.get(ServerlessNameNodeKeys.FN_END_TIME).getAsLong();
+            long fnStartTime = response.get(FN_START_TIME).getAsLong();
+            long fnEndTime = response.get(FN_END_TIME).getAsLong();
 
-            long enqueuedAt = response.get(ServerlessNameNodeKeys.ENQUEUED_TIME).getAsLong();
-            long dequeuedAt = response.get(ServerlessNameNodeKeys.DEQUEUED_TIME).getAsLong();
+            long enqueuedAt = response.get(ENQUEUED_TIME).getAsLong();
+            long dequeuedAt = response.get(DEQUEUED_TIME).getAsLong();
             long finishedProcessingAt = response.get(PROCESSING_FINISHED_TIME).getAsLong();
+
+            long numGarbageCollections = response.get(NUMBER_OF_GCs).getAsLong();
+            long garbageCollectionTime = response.get(GC_TIME).getAsLong();
 
             OperationPerformed operationPerformed
                     = new OperationPerformed(operationName, requestId,
                     startTime, endTime, enqueuedAt, dequeuedAt, fnStartTime, fnEndTime,
-                    deployment, issuedViaHTTP, issuedViaTCP, response.get(ServerlessNameNodeKeys.REQUEST_METHOD).getAsString(),
+                    deployment, issuedViaHTTP, issuedViaTCP, response.get(REQUEST_METHOD).getAsString(),
                     nameNodeId, cacheMisses, cacheHits, finishedProcessingAt, wasResubmittedViaStragglerMitigation,
-                    this.dfsClient.clientName);
+                    this.dfsClient.clientName, numGarbageCollections, garbageCollectionTime);
             operationsPerformed.put(requestId, operationPerformed);
         } catch (NullPointerException ex) {
             LOG.error("Unexpected NullPointerException encountered while creating OperationPerformed from JSON response:", ex);
@@ -816,8 +836,8 @@ public class ServerlessNameNodeClient implements ClientProtocol {
      * @param issuedViaTCP Indicates whether the associated operation was issued via TCP to a NN.
      * @param issuedViaHTTP Indicates whether the associated operation was issued via HTTP to a NN.
      */
-    private void createAndStoreOperationPerformed(NameNodeResult result, String operationName, String requestId,
-                                                  long startTime, long endTime, boolean issuedViaTCP,
+    private void createAndStoreOperationPerformed(NameNodeResultWithMetrics result, String operationName,
+                                                  String requestId, long startTime, long endTime, boolean issuedViaTCP,
                                                   boolean issuedViaHTTP, boolean wasResubmittedViaStragglerMitigation) {
         long nameNodeId = result.getNameNodeId();
 
@@ -833,12 +853,15 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         long dequeuedAt = result.getDequeuedTime();
         long finishedProcessingAt = result.getProcessingFinishedTime();
 
+        long garbageCollectionTime = result.getGarbageCollectionTime();
+        long numGarbageCollections = result.getNumGarbageCollections();
+
         OperationPerformed operationPerformed
                 = new OperationPerformed(operationName, requestId,
                 startTime, endTime, enqueuedAt, dequeuedAt, fnStartTime, fnEndTime,
                 deployment, issuedViaHTTP, issuedViaTCP, result.getRequestMethod(),
                 nameNodeId, cacheMisses, cacheHits, finishedProcessingAt, wasResubmittedViaStragglerMitigation,
-                this.dfsClient.clientName);
+                this.dfsClient.clientName, numGarbageCollections, garbageCollectionTime);
         operationsPerformed.put(requestId, operationPerformed);
     }
 
@@ -861,6 +884,11 @@ public class ServerlessNameNodeClient implements ClientProtocol {
     }
 
     public void addOperationPerformeds(Collection<OperationPerformed> operationPerformeds) {
+        for (OperationPerformed op : operationPerformeds)
+            operationsPerformed.put(op.getRequestId(), op);
+    }
+
+    public void addOperationPerformeds(OperationPerformed[] operationPerformeds) {
         for (OperationPerformed op : operationPerformeds)
             operationsPerformed.put(op.getRequestId(), op);
     }
@@ -893,10 +921,13 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         DescriptiveStatistics resubmittedStatistics = new DescriptiveStatistics();
         DescriptiveStatistics notResubmittedStatistics = new DescriptiveStatistics();
 
+        DescriptiveStatistics numGcStatistics = new DescriptiveStatistics();
+        DescriptiveStatistics gcTimeStatistics = new DescriptiveStatistics();
+
         for (OperationPerformed operationPerformed : opsPerformedList) {
             if (operationPerformed.getIssuedViaHttp()) {
                 double latency = operationPerformed.getLatency();
-                if (latency > 0) {
+                if (latency > 0 && latency < 1e6) {
                     httpStatistics.addValue(latency);
 
                     if (latency >= 150)
@@ -905,7 +936,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
             }
             if (operationPerformed.getIssuedViaTcp()) {
                 double latency = operationPerformed.getLatency();
-                if (latency > 0) {
+                if (latency > 0 && latency < 1e6) {
                     tcpStatistics.addValue(latency);
 
                     if (latency >= 150)
@@ -918,6 +949,9 @@ public class ServerlessNameNodeClient implements ClientProtocol {
             } else {
                 notResubmittedStatistics.addValue(operationPerformed.getResultReceivedTime() - operationPerformed.getInvokedAtTime());
             }
+
+            numGcStatistics.addValue(operationPerformed.getNumGarbageCollections());
+            gcTimeStatistics.addValue(operationPerformed.getGarbageCollectionTime());
         }
 
         System.out.println("\n-- SUMS ----------------------------------------------------------------------------------------------------------------------");
@@ -977,6 +1011,14 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         } catch (NotStrictlyPositiveException ex) {
             LOG.error("Encountered 'NotStrictlyPositiveException' while trying to generate latency histograms.");
         }
+
+        System.out.println("\n-- Garbage Collection Statistics -----------------------------------------------------------------------------------------------------");
+        System.out.println("Total number of GCs: " + numGcStatistics.getSum());
+        System.out.println("Total time spent GC-ing: " + gcTimeStatistics.getSum() + " ms");
+        System.out.println("Average number of GCs per task: " + numGcStatistics.getMean());
+        System.out.println("Average time spent GC-ing per task: " + gcTimeStatistics.getMean() + " ms");
+        System.out.println("Largest number of GCs for a single task: " + numGcStatistics.getMax());
+        System.out.println("Longest time spent GC-ing for a single task: " + gcTimeStatistics.getMax() + " ms");
 
         System.out.println("\n-- Lifetime HTTP & TCP Statistics ----------------------------------------------------------------------------------------------------");
         printLatencyStatisticsDetailed(0);
@@ -1221,7 +1263,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         opArguments.put("masked", masked.toShort());
         opArguments.put(ServerlessNameNodeKeys.CLIENT_NAME, dfsClient.clientName);
 
-        // Convert this argument (to the 'create' function) to a String so we can send it over JSON.
+        // Convert this argument (to the 'create' function) to a String so that we can send it over JSON.
         DataOutputBuffer out = new DataOutputBuffer();
         ObjectWritable.writeObject(out, flag, flag.getClass(), null);
         byte[] objectBytes = out.getData();
@@ -1230,10 +1272,10 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         opArguments.put("enumSetBase64", enumSetBase64);
         opArguments.put("createParent", createParent);
         LOG.warn("Using hard-coded replication value of 1.");
-        opArguments.put("replication", 1);
+        opArguments.put("replication", (short)1);
         opArguments.put("blockSize", blockSize);
 
-        // Include a flag to indicate whether or not the policy is non-null.
+        // Include a flag to indicate whether the policy is non-null.
         opArguments.put("policyExists", policy != null);
 
         // Only include these if the policy is non-null.
@@ -1954,6 +1996,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         Thread[] threads = new Thread[numDeployments * numThreadsPerDeployment];
         CountDownLatch startLatch = new CountDownLatch(numDeployments * numThreadsPerDeployment);
 
+        int counter = 0;
         for (int deploymentNumber = 0; deploymentNumber < numDeployments; deploymentNumber++) {
             final int depNum = deploymentNumber;
             for (int j = 0; j < numThreadsPerDeployment; j++) {
@@ -1979,7 +2022,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
                         }
                     }
                 });
-                threads[deploymentNumber] = thread;
+                threads[counter++] = thread;
             }
         }
 
@@ -2303,16 +2346,17 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         return 0;
     }
 
-    public int getTcpServerPort() {
-        return tcpServerPort;
+    /**
+     * IMPORTANT: This function just calls setTcpServerPort() on the ServerlessInvoker instance.
+     */
+    public void setTcpServerPort(int tcpServerPort) {
+        this.serverlessInvoker.setTcpPort(tcpServerPort);
     }
 
     /**
-     * IMPORTANT: This function also calls setTcpServerPort() on the ServerlessInvoker instance.
+     * IMPORTANT: This function just calls setUdpServerPort() on the ServerlessInvoker instance.
      */
-    public void setTcpServerPort(int tcpServerPort) {
-        this.tcpServerPort = tcpServerPort;
-
-        this.serverlessInvoker.setTcpPort(tcpServerPort);
+    public void setUdpServerPort(int udpServerPort) {
+        this.serverlessInvoker.setUdpPort(udpServerPort);
     }
 }

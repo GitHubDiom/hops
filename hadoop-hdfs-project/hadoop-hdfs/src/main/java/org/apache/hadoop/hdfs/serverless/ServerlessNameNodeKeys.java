@@ -21,6 +21,8 @@ public class ServerlessNameNodeKeys {
     public static final String REDIRECTED_WRITE = "REDIRECTED_WRITE";
     public static final String FLAG = "flag";
 
+    public static final String BENCHMARK_MODE = "BENCHMARK_MODE";
+
     public static final String ACTION_MEMORY = "actionMemory";
     public static final String REQUEST_METHOD = "requestMethod";
     public static final String CANCELLED = "cancelled";
@@ -44,6 +46,9 @@ public class ServerlessNameNodeKeys {
     public static final String ENQUEUED_TIME = "ENQUEUED_TIME";
     public static final String DEQUEUED_TIME = "DEQUEUED_TIME";
 
+    public static final String NUMBER_OF_GCs =  "NUM_GCs";
+    public static final String GC_TIME =        "GC_TIME";
+
     public static final String PROCESSING_FINISHED_TIME = "PROCESSING_FINISHED_TIME";
 
     /**
@@ -57,8 +62,10 @@ public class ServerlessNameNodeKeys {
     public static final String DEBUG_NDB = "debugNdb";
     public static final String DEBUG_STRING_NDB = "debugStringNdb";
     public static final String TCP_PORT = "TCP_PORT";
+    public static final String UDP_PORT = "UDP_PORT";
     public static final String CLIENT_INTERNAL_IP = "clientInternalIp";
     public static final String TCP_ENABLED = "tcpEnabled";
+    public static final String UDP_ENABLED = "udpEnabled";
     public static final String LOG_LEVEL = "LOG_LEVEL";
     public static final String CONSISTENCY_PROTOCOL_ENABLED = "CONSISTENCY_PROTOCOL_ENABLED";
 
