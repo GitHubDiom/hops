@@ -160,6 +160,9 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
   public static final String SERVERLESS_TCP_REQUESTS_ENABLED = "serverless.tcp.enabled";
   public static final boolean SERVERLESS_TCP_REQUESTS_ENABLED_DEFAULT = true;
 
+  public static final String SERVERLESS_DEFAULT_LOG_LEVEL = "serverless.default.loglevel";
+  public static final String SERVERLESS_DEFAULT_LOG_LEVEL_DEFAULT = "DEBUG";
+
   /**
    * Use UDP instead of TCP.
    */
@@ -225,7 +228,7 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
   public static final String SERVERLESS_ZOOKEEPER_HOSTNAMES = "serverless.zookeepers.hosts";
   public static final String[] SERVERLESS_ZOOKEEPER_HOSTNAMES_DEFAULT = {
           "10.241.64.15:2181",    // NDB Manager (ndb_mgmd) VM.
-          "10.150.15.214:2181",   // Serverless HopsFS DataNode VM.
+          "10.150.0.19:2181",     // NDB DataNode.
           "10.241.64.14:2181"     // HopsFS Client VM.
   };
 
@@ -384,7 +387,7 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
   public static final String DFS_TRANSACTION_STATS_WRITER_ROUND = "dfs.transaction.stats.writerround";
   public static final int DFS_TRANSACTION_STATS_WRITER_ROUND_DEFAULT = 120;
   public static final String  DFS_DIR_DELETE_BATCH_SIZE= "dfs.dir.delete.batch.size";
-  public static final int DFS_DIR_DELETE_BATCH_SIZE_DEFAULT = 50;
+  public static final int DFS_DIR_DELETE_BATCH_SIZE_DEFAULT = 512;
 
   /*for client failover api*/
   // format {ip:port, ip:port, ip:port} comma separated

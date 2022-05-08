@@ -155,7 +155,8 @@ public class OpenWhiskHandler extends BaseHandler {
             int logLevel = userArguments.get(LOG_LEVEL).getAsInt();
             // LOG.debug("Setting log4j log level to: " + logLevel + ".");
 
-            LogManager.getRootLogger().setLevel(getLogLevelFromInteger(logLevel));
+            LogManager.getRootLogger().setLevel(Level.TRACE);
+            //LogManager.getRootLogger().setLevel(getLogLevelFromInteger(logLevel));
         }
 
         if (userArguments.has(CONSISTENCY_PROTOCOL_ENABLED)) {
@@ -490,14 +491,14 @@ public class OpenWhiskHandler extends BaseHandler {
         response.add("headers", headers);
         response.add("body", resultJson);
 
-        if (LOG.isDebugEnabled()) {
-            LOG.debug("Contents of result to be returned to the client: ");
-            for (String key : resultJson.keySet())
-                if (key.equals(RESULT))
-                    LOG.debug("Result: <Content Omitted>");
-                else
-                    LOG.debug(key + ": " + resultJson.get(key).toString());
-        }
+//        if (LOG.isDebugEnabled()) {
+//            LOG.debug("Contents of result to be returned to the client: ");
+//            for (String key : resultJson.keySet())
+//                if (key.equals(RESULT))
+//                    LOG.debug("Result: <Content Omitted>");
+//                else
+//                    LOG.debug(key + ": " + resultJson.get(key).toString());
+//        }
 
         return response;
     }

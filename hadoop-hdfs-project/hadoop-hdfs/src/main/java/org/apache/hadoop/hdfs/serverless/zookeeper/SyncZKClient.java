@@ -236,14 +236,14 @@ public class SyncZKClient implements ZKClient {
      */
     private PersistentWatcher getOrCreatePersistentWatcher(String path, boolean recursive) {
         return watchers.computeIfAbsent(path, p -> {
-            if (LOG.isDebugEnabled())
-                LOG.debug("Creating new PersistentWatcher for path '" + p + '"');
+            if (LOG.isTraceEnabled())
+                LOG.trace("Creating new PersistentWatcher for path '" + p + '"');
             PersistentWatcher persistentWatcher = new PersistentWatcher(this.client, p, recursive);
-            if (LOG.isDebugEnabled())
-                LOG.debug("Successfully created PersistentWatcher for path '" + p + "'. Starting watch now.");
+            if (LOG.isTraceEnabled())
+                LOG.trace("Successfully created PersistentWatcher for path '" + p + "'. Starting watch now.");
             persistentWatcher.start();
-            if (LOG.isDebugEnabled())
-                LOG.debug("Successfully started and started PersistentWatcher for path '" + p + "'.");
+            if (LOG.isTraceEnabled())
+                LOG.trace("Successfully started and started PersistentWatcher for path '" + p + "'.");
             return persistentWatcher;
         });
     }
@@ -321,21 +321,21 @@ public class SyncZKClient implements ZKClient {
         List<String> invs = this.client.getChildren().forPath(invPath);
 
         for (String ack : acks) {
-            if (LOG.isDebugEnabled())
-                LOG.debug("Removing ACK '" + ack + "' now...");
+            //if (LOG.isDebugEnabled())
+            //    LOG.debug("Removing ACK '" + ack + "' now...");
             this.client.delete().forPath(ackPath + "/" + ack);
         }
 
         for (String inv : invs) {
-            if (LOG.isDebugEnabled())
-                LOG.debug("Removing INV '" + inv + "' now...");
+            //if (LOG.isDebugEnabled())
+            //    LOG.debug("Removing INV '" + inv + "' now...");
             this.client.delete().forPath(invPath + "/" + inv);
         }
 
-        if (LOG.isDebugEnabled()) LOG.debug("Removing invalidation from ZooKeeper cluster under path: '" + invPath + "'");
+        //if (LOG.isDebugEnabled()) LOG.debug("Removing invalidation from ZooKeeper cluster under path: '" + invPath + "'");
         this.client.delete().forPath(invPath);
 
-        if (LOG.isDebugEnabled()) LOG.debug("Removing ACK root from ZooKeeper cluster under path: '" + ackPath + "'");
+        //if (LOG.isDebugEnabled()) LOG.debug("Removing ACK root from ZooKeeper cluster under path: '" + ackPath + "'");
         this.client.delete().forPath(ackPath);
     }
 
