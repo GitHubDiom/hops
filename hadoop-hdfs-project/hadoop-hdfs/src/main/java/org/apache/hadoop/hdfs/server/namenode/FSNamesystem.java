@@ -424,9 +424,8 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean, NameNodeMXBe
    * @throws IOException
    *     if loading fails
    */
-  static FSNamesystem loadFromDisk(Configuration conf, ServerlessNameNode namenode) throws IOException {
-
-    FSNamesystem namesystem = new FSNamesystem(conf, namenode);
+  static FSNamesystem loadFromDisk(Configuration conf, ServerlessNameNode namenode, int deploymentNumber) throws IOException {
+    FSNamesystem namesystem = new FSNamesystem(conf, namenode, deploymentNumber);
     StartupOption startOpt = ServerlessNameNode.getStartupOption(conf);
     if (startOpt == StartupOption.RECOVER) {
       namesystem.setSafeMode(SafeModeAction.SAFEMODE_ENTER);
@@ -466,7 +465,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean, NameNodeMXBe
    * @throws IOException
    *      on bad configuration
    */
-  FSNamesystem(Configuration conf, ServerlessNameNode namenode) throws IOException {
+  FSNamesystem(Configuration conf, ServerlessNameNode namenode, int deploymentNumber) throws IOException {
     try {
       provider = DFSUtil.createKeyProviderCryptoExtension(conf);
       if (provider == null) {
@@ -486,7 +485,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean, NameNodeMXBe
               DFS_NAMENODE_RESOURCE_CHECK_INTERVAL_DEFAULT);
 
       // this.metadataCache = new LRUMetadataCache<>(conf);
-      this.metadataCacheManager = new MetadataCacheManager(conf);
+      this.metadataCacheManager = new MetadataCacheManager(conf, deploymentNumber);
 
       this.blockManager = new BlockManager(this, conf);
       this.erasureCodingEnabled =
@@ -1055,7 +1054,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean, NameNodeMXBe
       metadataCacheManager.invalidateINodesByPrefix(subtreeRoot);
     } else {
       for (long id : invalidatedINodes) {
-        LOG.debug("Attempting to invalidate INode " + id + " (if we have it cached).");
+        if (LOG.isTraceEnabled()) LOG.trace("Attempting to invalidate INode " + id + " (if we have it cached).");
         metadataCacheManager.invalidateINode(id);
       }
     }
@@ -1117,7 +1116,8 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean, NameNodeMXBe
       }
     }
 
-    LOG.debug("Discovered " + pendingAcks.size() + (pendingAcks.size() == 1 ? " pending ack" : " pending acks") +
+    if (LOG.isTraceEnabled())
+      LOG.trace("Discovered " + pendingAcks.size() + (pendingAcks.size() == 1 ? " pending ack" : " pending acks") +
             " in intermediate storage: " + org.apache.commons.lang3.StringUtils.join(pendingAcks, ", ") + ".");
 
     exponentialBackOff.reset();
@@ -1127,7 +1127,8 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean, NameNodeMXBe
       try {
         writeAcknowledgementDataAccess.acknowledge(pendingAcks, localDeploymentNumber);
         success = true;
-        LOG.debug("Successfully ACK'd " + pendingAcks.size() + " pending ack " +
+        if (LOG.isTraceEnabled())
+          LOG.trace("Successfully ACK'd " + pendingAcks.size() + " pending ack " +
                 (pendingAcks.size() == 1 ? "entry" : "entries") + " in intermediate storage.");
       } catch (StorageException e) {
         LOG.error("Encountered exception while trying to acknowledge pending ACKs for NameNode "
@@ -1216,7 +1217,6 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean, NameNodeMXBe
         HDFSOperationType.GET_BLOCK_LOCATIONS, src) {
       @Override
       public void acquireLock(TransactionLocks locks) throws IOException {
-        // long s = System.currentTimeMillis();
         LockFactory lf = getInstance();
         INodeLock il = lf.getINodeLock(lockType, INodeResolveType.PATH, src)
             .setNameNodeID(serverlessNameNode.getId())
@@ -2119,7 +2119,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean, NameNodeMXBe
       EncryptionFaultInjector.getInstance().startFileAfterGenerateKey();
     }
         
-    // Proceed with the create, using the computed cipher suite and 
+    // Proceed with the create operation, using the computed cipher suite and
     // generated EDEK
     stat = (HdfsFileStatus) new HopsTransactionalRequestHandler(
         HDFSOperationType.START_FILE, src) {

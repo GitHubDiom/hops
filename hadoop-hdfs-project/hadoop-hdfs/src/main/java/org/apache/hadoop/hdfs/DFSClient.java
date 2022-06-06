@@ -109,12 +109,10 @@ import org.apache.hadoop.hdfs.server.datanode.CachingStrategy;
 import org.apache.hadoop.hdfs.server.namenode.ServerlessNameNode;
 import org.apache.hadoop.hdfs.server.namenode.SafeModeException;
 import org.apache.hadoop.hdfs.protocol.HdfsBlocksMetadata;
-import org.apache.hadoop.hdfs.serverless.ServerlessNameNodeKeys;
 import org.apache.hadoop.hdfs.serverless.invoking.ServerlessNameNodeClient;
 import org.apache.hadoop.hdfs.serverless.invoking.ServerlessInvokerBase;
 import org.apache.hadoop.hdfs.serverless.invoking.ServerlessInvokerFactory;
 import io.hops.metrics.OperationPerformed;
-import org.apache.hadoop.hdfs.serverless.operation.ActiveServerlessNameNodeList;
 import org.apache.hadoop.io.DataOutputBuffer;
 import org.apache.hadoop.io.EnumSetWritable;
 import org.apache.hadoop.io.IOUtils;
@@ -187,7 +185,7 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
   /**
    * Responsible for invoking the Serverless NameNode(s).
    */
-  public ServerlessInvokerBase<JsonObject> serverlessInvoker;
+  public ServerlessInvokerBase serverlessInvoker;
 
   /**
    * Issue HTTP requests to this to invoke serverless functions.
@@ -541,6 +539,8 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
 
   /**
    * Same as this(nameNodeUri, null, conf, stats);
+   *
+   * Need to call the {@link DFSClient#initialize()} function before use.
    */
   public DFSClient(URI nameNodeUri, Configuration conf,
                    FileSystem.Statistics stats)
@@ -561,7 +561,7 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
 
     this.serverlessInvoker = ServerlessInvokerFactory.getServerlessInvoker(serverlessPlatformName);
     this.serverlessInvoker.setIsClientInvoker(true);
-    this.serverlessInvoker.setConfiguration(conf, "C-" + this.getClientName());
+    this.serverlessInvoker.setConfiguration(conf, "C-" + this.getClientName(), serverlessEndpoint);
 
     // Copy only the required DFSClient configuration
     this.tracer = FsTracer.get(conf);
@@ -601,7 +601,11 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
               nnFallbackToSimpleAuth);
     }
 
+    // Create the ServerlessNameNodeClient instance and call then registerAndStartTcpServer()
+    // so that it gets assigned a TCP/UDP server.
     this.namenode = new ServerlessNameNodeClient(conf, this);
+
+    // this.namenode = new ServerlessNameNodeClient(conf, this);
 
     LOG.warn("Skipping the set-up of namenode and leaderNN variables...");
     /*if (proxyInfo != null) {
@@ -674,6 +678,13 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
             TrustedChannelResolver.getInstance(conf), nnFallbackToSimpleAuth);
   }
 
+  public void initialize() throws IOException {
+    if (namenode instanceof ServerlessNameNodeClient) {
+      ServerlessNameNodeClient client = (ServerlessNameNodeClient)namenode;
+      client.registerAndStartTcpServer();
+    }
+  }
+
   /**
    * Create a new DFSClient connected to the given nameNodeUri or rpcNamenode.
    * If HA is enabled and a positive value is set for
@@ -709,7 +720,7 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
 
     this.serverlessInvoker = ServerlessInvokerFactory.getServerlessInvoker(serverlessPlatformName);
     this.serverlessInvoker.setIsClientInvoker(true);
-    this.serverlessInvoker.setConfiguration(conf, "C-" + getClientName());
+    this.serverlessInvoker.setConfiguration(conf, "C-" + getClientName(), serverlessEndpoint);
 
     this.ugi = UserGroupInformation.getCurrentUser();
 
@@ -1741,10 +1752,10 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
   }
 
   // Added for debugging serverless NN.
-  public void printDebugInformation() {
+  public int printDebugInformation() {
     if (namenode instanceof ServerlessNameNodeClient) {
       ServerlessNameNodeClient client = (ServerlessNameNodeClient)namenode;
-      client.printDebugInformation();
+      return client.printDebugInformation();
     } else {
       // The type of the `namenode` variable for Serverless HopsFS should be 'ServerlessNameNodeClient'.
       // If it isn't, then none of the Serverless-specific APIs will work.

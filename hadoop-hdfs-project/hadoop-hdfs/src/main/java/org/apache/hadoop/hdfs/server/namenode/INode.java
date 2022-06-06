@@ -559,8 +559,6 @@ public abstract class INode implements Comparable<byte[]>, LinkedElement, Serial
       return null;
     }
     if (parent == null && getParentId() != HdfsConstantsClient.GRANDFATHER_INODE_ID) {
-      // LOG.debug("Using EntityManager to find parent of INode " + getId() + " (" + getLocalName() + ")");
-
       ServerlessNameNode instance = ServerlessNameNode.tryGetNameNodeInstance(false);
 
       if (instance == null) {
@@ -719,7 +717,7 @@ public abstract class INode implements Comparable<byte[]>, LinkedElement, Serial
       throw new AssertionError("Absolute path required");
     }
 
-    int pathComponents = 0;
+    int pathComponents = 1;
     for (int i = 0; i < path.length(); i++) {
       if (path.charAt(i) == Path.SEPARATOR_CHAR && i != (path.length() - 1))
         pathComponents++;
@@ -949,7 +947,7 @@ public abstract class INode implements Comparable<byte[]>, LinkedElement, Serial
 
   protected void remove(INode node)
       throws IOException {
-    LOG.debug("Removing INode " + node.toString() + " now...");
+    if (LOG.isTraceEnabled()) LOG.trace("Removing INode " + node.toString() + " now...");
     EntityManager.remove(node);
     //if This inode is of type INodeDirectoryWithQuota then also delete the INode Attribute table
     if ((node instanceof INodeDirectory) && ((INodeDirectory) node).isWithQuota()) {

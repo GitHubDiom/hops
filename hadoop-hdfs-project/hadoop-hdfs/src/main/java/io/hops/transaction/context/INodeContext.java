@@ -25,6 +25,7 @@ import io.hops.exception.StorageException;
 import io.hops.exception.TransactionContextException;
 import io.hops.metadata.common.FinderType;
 import io.hops.metadata.hdfs.dal.INodeDataAccess;
+import io.hops.transaction.EntityManager;
 import io.hops.transaction.lock.BaseINodeLock;
 import io.hops.transaction.lock.Lock;
 import io.hops.transaction.lock.TransactionLockTypes;
@@ -79,7 +80,7 @@ public class INodeContext extends BaseEntityContext<Long, INode> {
    * @return The INode with the specified ID, or null if the INode is not in the cache.
    */
   private INode checkCache(long id) {
-    if (!EntityContext.isLocalMetadataCacheEnabled()) return null;
+    if (!EntityContext.areMetadataCacheReadsEnabled()) return null;
 
     InMemoryINodeCache metadataCache = getMetadataCache();
     if (metadataCache == null) {
@@ -95,7 +96,7 @@ public class INodeContext extends BaseEntityContext<Long, INode> {
    * @return The INode for the file/directory at the specified path, or null if the INode is not in the cache.
    */
   private INode checkCache(String path) {
-    if (!EntityContext.isLocalMetadataCacheEnabled()) return null;
+    if (!EntityContext.areMetadataCacheReadsEnabled()) return null;
 
     InMemoryINodeCache metadataCache = getMetadataCache();
     if (metadataCache == null) {
@@ -112,7 +113,7 @@ public class INodeContext extends BaseEntityContext<Long, INode> {
    * @return The desired INode if it is was in the cache, otherwise null.
    */
   private INode checkCache(String localName, long parentId) {
-    if (!EntityContext.isLocalMetadataCacheEnabled()) return null;
+    if (!EntityContext.areMetadataCacheReadsEnabled()) return null;
 
     InMemoryINodeCache metadataCache = getMetadataCache();
     if (metadataCache == null) {
@@ -122,55 +123,24 @@ public class INodeContext extends BaseEntityContext<Long, INode> {
     return metadataCache.getByParentINodeIdAndLocalName(parentId, localName);
   }
 
-  private void updateCache(List<INode> nodes) throws TransactionContextException, StorageException {
-    if (nodes == null) {
-      // LOG.warn("Attempting to update cache with null List<INode>.");
-      return;
-    }
-
-    InMemoryINodeCache metadataCache = getMetadataCache();
-    if (metadataCache == null) return;
-
-    for (INode node : nodes) {
-      metadataCache.put(node.getFullPathName(), node.getId(), node);
-    }
-  }
-
   /**
-   * Add an INode to the cache, if it is non-null. If the INode parameter is null, this just returns.
+   * Attempt to add an INode to the cache, if it is non-null. If the INode parameter is null, this just returns.
+   *
+   * This will fail to add the INode to the cache of the full path name cannot be retrieved using data
+   * already contained locally (i.e., going to NDB is not an option here).
    *
    * @param node The INode to add to the cache.
-   * @param localName The local name of the INode. Only used for debugging purposes (i.e., when INode is null).
-   * @param parentId The INode ID of the given INode. Only used for debugging purposes (i.e., when INode is null).
    */
-  private void updateCache(INode node, String localName, long parentId) throws TransactionContextException, StorageException {
-    if (node == null) {
-      // LOG.warn("Attempting to update cache with null value for INode '" + localName + "', parentID=" + parentId + ".");
+  private void tryUpdateCache(INode node) throws TransactionContextException, StorageException {
+    if (node == null || !EntityContext.areMetadataCacheWritesEnabled()) {
       return;
     }
 
     InMemoryINodeCache metadataCache = getMetadataCache();
     if (metadataCache == null) return;
 
-    metadataCache.put(node.getFullPathName(), node.getId(), node);
-  }
-
-  /**
-   * Add an INode to the cache, if it is non-null. If the INode parameter is null, this just returns.
-   *
-   * @param node The INode to add to the cache.
-   * @param inodeId The ID of the INode. Only used for debugging purposes (i.e., when INode is null).
-   */
-  private void updateCache(INode node, long inodeId) throws TransactionContextException, StorageException {
-    if (node == null) {
-      // LOG.warn("Attempting to update cache with null INode.");
-      return;
-    }
-
-    InMemoryINodeCache metadataCache = getMetadataCache();
-    if (metadataCache == null) return;
-
-    metadataCache.put(node.getFullPathName(), node.getId(), node);
+    String fullPathName = node.getFullPathName();
+    metadataCache.put(fullPathName, node.getId(), node);
   }
 
   @Override
@@ -325,7 +295,7 @@ public class INodeContext extends BaseEntityContext<Long, INode> {
 
     // if the list is not empty then check for the lock types
     // lock type is checked after when list length is checked
-    // because some times in the tx handler the acquire lock
+    // because sometimes in the tx handler, the 'acquire lock'
     // function is empty and in that case tlm will throw
     // null pointer exceptions
     Collection<INode> removed = getRemoved();
@@ -343,7 +313,8 @@ public class INodeContext extends BaseEntityContext<Long, INode> {
               lock != TransactionLockTypes.INodeLockType.WRITE && lock !=
               TransactionLockTypes.INodeLockType.WRITE_ON_TARGET_AND_PARENT) {
             throw new LockUpgradeException(
-                "Trying to remove inode id=" + inode.getId() + " acquired lock was " + lock);
+                "Trying to remove inode " + inode.getLocalName() + ", id=" + inode.getId() +
+                        " acquired lock was " + lock);
           }
         }
       }
@@ -356,7 +327,7 @@ public class INodeContext extends BaseEntityContext<Long, INode> {
               lock != TransactionLockTypes.INodeLockType.WRITE && lock !=
               TransactionLockTypes.INodeLockType.WRITE_ON_TARGET_AND_PARENT) {
             throw new LockUpgradeException(
-                "Trying to update inode id=" + inode.getId() +
+                "Trying to update inode " + inode.getLocalName() + ", id=" + inode.getId() +
                     " acquired lock was " + lock);
           }
         }
@@ -453,7 +424,7 @@ public class INodeContext extends BaseEntityContext<Long, INode> {
         inodesNameParentIndex.put(result.nameParentKey(), result);
         miss(inodeFinder, result, "id", inodeId, "name", result.getLocalName(), "parent_id", result.getParentId(),
           "partition_id", result.getPartitionId());
-        updateCache(result, inodeId);
+        tryUpdateCache(result);
       } else {
         if (LOG.isTraceEnabled()) LOG.trace("Failed to retrieve INode ID=" + inodeId + " from intermediate storage.");
         miss(inodeFinder, result, "id");
@@ -498,7 +469,7 @@ public class INodeContext extends BaseEntityContext<Long, INode> {
         gotFromDBWithPossibleInodeId(result, possibleInodeId);
         inodesNameParentIndex.put(nameParentKey, result);
         missUpgrade(inodeFinder, result, "name", name, "parent_id", parentId, "partition_id", partitionId);
-        updateCache(result, name, parentId);
+        tryUpdateCache(result);
       } else {
         if (LOG.isTraceEnabled()) LOG.trace("Successfully retrieved INode '" + name + "', parentID=" + parentId + " from INode Hint Cache.");
         hit(inodeFinder, result, "name", name, "parent_id", parentId, "partition_id", partitionId);
@@ -519,7 +490,7 @@ public class INodeContext extends BaseEntityContext<Long, INode> {
         inodesNameParentIndex.put(nameParentKey, result);
         miss(inodeFinder, result, "name", name, "parent_id", parentId, "partition_id", partitionId,
             "possible_inode_id",possibleInodeId);
-        updateCache(result, name, parentId);
+        tryUpdateCache(result);
       }
     }
     return result;
@@ -633,7 +604,7 @@ public class INodeContext extends BaseEntityContext<Long, INode> {
   }
 
   private List<INode> findBatch(INode.Finder inodeFinder, String[] names,
-                                long[] parentIds, long[] partitionIds) throws StorageException {
+                                long[] parentIds, long[] partitionIds) throws StorageException, TransactionContextException {
     INode rootINode = null;
     boolean addCachedRootInode = false;
     if (canReadCachedRootINode(names[0], parentIds[0])) {
@@ -659,10 +630,10 @@ public class INodeContext extends BaseEntityContext<Long, INode> {
     return syncInodeInstances(batch);
   }
 
-  private List<INode> syncInodeInstances(List<INode> newInodes) {
+  private List<INode> syncInodeInstances(List<INode> newInodes) throws TransactionContextException, StorageException {
     List<INode> finalList = new ArrayList<>(newInodes.size());
 
-    if (LOG.isTraceEnabled()) LOG.trace("Retrieved batch of INodes from NDB: " + StringUtils.join(", ", newInodes));
+    if (LOG.isTraceEnabled()) LOG.trace("Retrieved batch of INodes from NDB: " + StringUtils.join(newInodes, ", "));
     
     for (INode inode : newInodes) {
       if (isRemoved(inode.getId())) {
@@ -680,6 +651,8 @@ public class INodeContext extends BaseEntityContext<Long, INode> {
       } else {
         inodesNameParentIndex.put(key, inode);
       }
+
+      tryUpdateCache(inode);
     }
     Collections.sort(finalList, INode.Order.ByName);
     return finalList;

@@ -31,6 +31,8 @@ import io.hops.metadata.hdfs.entity.INodeIdentifier;
 import io.hops.transaction.EntityManager;
 
 import java.io.IOException;
+
+import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.hdfs.server.namenode.*;
 
 import java.util.ArrayList;
@@ -50,7 +52,6 @@ import org.apache.hadoop.hdfs.protocol.HdfsConstantsClient;
 import org.apache.hadoop.hdfs.protocol.UnresolvedPathException;
 import org.apache.hadoop.hdfs.server.namenode.INodeDirectory;
 import org.apache.hadoop.hdfs.serverless.cache.InMemoryINodeCache;
-import org.apache.hadoop.util.StringUtils;
 
 public abstract class BaseINodeLock extends Lock {
   private final Map<INode, TransactionLockTypes.INodeLockType>
@@ -194,33 +195,6 @@ public abstract class BaseINodeLock extends Lock {
     Cache.getInstance().set(path, iNodes);
   }
 
-  /**
-   * Attempt to update the local, in-memory metadata cache. This should be called whenever
-   * the {@link BaseINodeLock#updateResolvingCache} function is called.
-   *
-   * @param iNodes The INodes we retrieved from intermediate storage that we'd now like to cache.
-   */
-  private void updateMetadataCache(List<INode> iNodes) throws TransactionContextException, StorageException {
-    if (iNodes == null)
-      throw new IllegalArgumentException("The list of INodes to cache must be non-null.");
-
-    ServerlessNameNode instance = ServerlessNameNode.tryGetNameNodeInstance(false);
-    if (instance == null) {
-      LOG.warn("Cannot update in-memory metadata cache because ServerlessNameNode instance is null.");
-      return;
-    }
-
-    // LOG.debug("Caching " + iNodes.size() + " INodes in local, in-memory cache.");
-
-    InMemoryINodeCache metadataCache = instance.getNamesystem().getMetadataCacheManager().getINodeCache();
-    for (INode node : iNodes) {
-      // In theory, getFullPathName() could access storage, but given we'd only be doing this after having
-      // accessed storage (that's why we're updating the cache), all of this information should already
-      // be available locally.
-      metadataCache.put(node.getFullPathName(), node.getId(), node);
-    }
-  }
-
   void addPathINodes(String path, List<INode> iNodes) {
     resolvedINodesMap.putPathINodes(path, iNodes);
   }
@@ -349,6 +323,10 @@ public abstract class BaseINodeLock extends Lock {
     if (inode == null) {
       return;
     }
+
+    if (LOG.isTraceEnabled()) LOG.trace("Resolved INode " + inode.getLocalName() + " (id=" + inode.getId() +
+            ") with lock " + lock.name());
+
     TransactionLockTypes.INodeLockType oldLock = allLockedInodesInTx.get(inode);
     if (oldLock == null || oldLock.compareTo(lock) < 0) {
       allLockedInodesInTx.put(inode, lock);
@@ -524,6 +502,7 @@ public abstract class BaseINodeLock extends Lock {
     List<INode> fetchINodes(final TransactionLockTypes.INodeLockType lockType, String path, boolean resolveLink) throws
         IOException {
       long[] inodeIds = Cache.getInstance().get(path);
+      if (LOG.isTraceEnabled()) LOG.trace("Resolving INodes along path '" + path + "'. INode IDs: " + StringUtils.join(inodeIds, ','));
       if (inodeIds != null) {
         final String[] names = INode.getPathNames(path);
         final boolean partial = names.length > inodeIds.length;
@@ -567,7 +546,7 @@ public abstract class BaseINodeLock extends Lock {
     }
 
     INode lockInode(final TransactionLockTypes.INodeLockType lockType, long inodeId) throws IOException {
-      //LOG.debug("Locking INode " + inodeId + " with lock type " + lockType.name() + " now...");
+      if (LOG.isTraceEnabled()) LOG.trace("Locking INode " + inodeId + " with lock type " + lockType.name() + " now...");
       setINodeLockType(lockType);
       INode targetInode = INodeUtil.getNode(inodeId, true);
       setINodeLockType(getDefaultInodeLockType());
@@ -581,6 +560,7 @@ public abstract class BaseINodeLock extends Lock {
     }
 
     List<INode> lockInodeAndParent(final TransactionLockTypes.INodeLockType lockType, long inodeId) throws IOException {
+      if (LOG.isTraceEnabled()) LOG.trace("Locking INode " + inodeId + " AND its parent with lock type " + lockType.name() + " now...");
       List<INode> inodes = new LinkedList<>();
       INodeIdentifier targetIdentifier = Cache.getInstance().get(inodeId);
       if (targetIdentifier == null) {
@@ -751,9 +731,10 @@ public abstract class BaseINodeLock extends Lock {
       boolean canUseInMemoryMetadataCache = (lockType == TransactionLockTypes.INodeLockType.READ ||
                                              lockType == TransactionLockTypes.INodeLockType.READ_COMMITTED);
 
-//      LOG.debug("Trying to resolve " + names.length + " INodes: " + StringUtils.join(", ", names) +
-//              " using PathResolver. LockType: " + lockType.name() + ", path: '" + path +
-//              "', CanUseMetadataCache: " + canUseInMemoryMetadataCache);
+      if (LOG.isTraceEnabled())
+        LOG.trace("Trying to resolve " + names.length + " INodes: " + StringUtils.join(names, ", ") +
+                " using PathResolver. LockType: " + lockType.name() + ", path: '" + path +
+                "', CanUseMetadataCache: " + canUseInMemoryMetadataCache);
 
       List<INode> inodes = null;
       if (rowsToReadWithDefaultLock > 0) {
@@ -803,6 +784,10 @@ public abstract class BaseINodeLock extends Lock {
         TransactionLockTypes.INodeLockType currentINodeLock = identifyLockType(lockType, resolver.getCount() + 1,
             components);
         setINodeLockType(currentINodeLock);
+        if (LOG.isTraceEnabled()) {
+          if (currentINode != null) LOG.trace("Current INode: " + currentINode.getLocalName() + " (id=" + currentINode.getId() + "). Resolving next component with lock " + currentINodeLock.name() + ".");
+          else LOG.trace("Current INode: null. Resolving next component with lock " + currentINodeLock.name() + ".");
+        }
         currentINode = resolver.next();
         if (currentINode != null) {
           addLockedINodes(currentINode, currentINodeLock);

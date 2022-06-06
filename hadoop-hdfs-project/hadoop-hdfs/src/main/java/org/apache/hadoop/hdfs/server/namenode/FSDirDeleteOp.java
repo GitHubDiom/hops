@@ -17,7 +17,6 @@
  */
 package org.apache.hadoop.hdfs.server.namenode;
 
-import com.ctc.wstx.util.StringUtil;
 import com.google.gson.JsonObject;
 import io.hops.metadata.hdfs.entity.*;
 import io.hops.transaction.handler.HDFSOperationType;
@@ -37,9 +36,10 @@ import org.apache.hadoop.fs.permission.AclEntry;
 import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.hadoop.hdfs.server.namenode.INode.BlocksMapUpdateInfo;
 import org.apache.hadoop.hdfs.serverless.BaseHandler;
+import org.apache.hadoop.hdfs.serverless.execution.futures.ServerlessHttpFuture;
 import org.apache.hadoop.hdfs.serverless.invoking.ArgumentContainer;
 import org.apache.hadoop.hdfs.serverless.invoking.ServerlessInvokerBase;
-import org.apache.hadoop.hdfs.serverless.operation.ConsistencyProtocol;
+import org.apache.hadoop.hdfs.serverless.consistency.ConsistencyProtocol;
 import org.apache.hadoop.ipc.RetriableException;
 import org.apache.hadoop.ipc.Server;
 import org.apache.hadoop.util.ChunkedArrayList;
@@ -84,7 +84,7 @@ class FSDirDeleteOp {
                                        removedINodes, mtime);
     }
 
-    LOG.debug("Removed " + filesRemoved + " file(s).");
+    if (LOG.isTraceEnabled()) LOG.trace("Removed " + filesRemoved + " file(s).");
     return filesRemoved;
   }
 
@@ -314,7 +314,7 @@ class FSDirDeleteOp {
           // to process before trying to offload batches to other NNs.
           if (batches.size() > 1 && !BaseHandler.localModeEnabled) {
             ExecutorService executorService = Executors.newFixedThreadPool(batches.size() - 1);
-            ServerlessInvokerBase<JsonObject> serverlessInvoker = instance.getServerlessInvoker();
+            ServerlessInvokerBase serverlessInvoker = instance.getServerlessInvoker();
             // final HashMap<String, Future<Boolean>> futures = new HashMap<>();
             final String serverlessEndpointBase = instance.getServerlessEndpointBase();
             if (LOG.isDebugEnabled()) LOG.debug("Submitting " + (batches.size() - 1) + " batch(es) of deletes to other NameNodes.");
@@ -339,12 +339,13 @@ class FSDirDeleteOp {
 
               int finalTargetDeployment = targetDeployment;
               Future<Boolean> future = executorService.submit(() -> {
-                JsonObject response = serverlessInvoker.invokeNameNodeViaHttpPost(
-                        "subtreeDeleteSubOperation", serverlessEndpointBase, new HashMap<>(),
-                        argumentContainer, requestId, finalTargetDeployment);
+                JsonObject responseJson = ServerlessInvokerBase.issueHttpRequestWithRetries(
+                        serverlessInvoker, "subtreeDeleteSubOperation", serverlessEndpointBase,
+                        null, argumentContainer, requestId, finalTargetDeployment);
 
                 // Attempt to extract the result. If it is null, then return false. Otherwise, return the result.
-                Object result = serverlessInvoker.extractResultFromJsonResponse(response);
+                Object result = serverlessInvoker.extractResultFromJsonResponse(responseJson);
+
                 if (result == null) return false;
                 return (boolean) result;
               });
@@ -585,7 +586,7 @@ class FSDirDeleteOp {
 
     incrDeletedFileCount(filesRemoved);
 
-    if (LOG.isDebugEnabled()) LOG.debug("Removed INodes: " + StringUtils.join(", ", removedINodes));
+    if (LOG.isTraceEnabled()) LOG.trace("Removed INodes: " + StringUtils.join(removedINodes, ", "));
     fsn.removeLeasesAndINodes(src, removedINodes);
     fsn.removeBlocks(collectedBlocks); // Incremental deletion of blocks
     collectedBlocks.clear();

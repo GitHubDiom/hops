@@ -37,6 +37,7 @@ import org.apache.hadoop.hdfs.protocol.*;
 import org.apache.hadoop.hdfs.protocolPB.DatanodeProtocolClientSideTranslatorPB;
 import org.apache.hadoop.hdfs.server.common.IncorrectVersionException;
 import org.apache.hadoop.hdfs.server.protocol.*;
+import org.apache.hadoop.hdfs.serverless.execution.futures.ServerlessHttpFuture;
 import org.apache.hadoop.hdfs.serverless.invoking.ArgumentContainer;
 import org.apache.hadoop.hdfs.serverless.invoking.ServerlessInvokerBase;
 import org.apache.hadoop.hdfs.serverless.invoking.ServerlessInvokerFactory;
@@ -49,6 +50,7 @@ import org.apache.hadoop.util.VersionUtil;
 import java.net.InetSocketAddress;
 import java.net.SocketTimeoutException;
 import java.util.*;
+import java.util.concurrent.ExecutionException;
 
 import static org.apache.hadoop.hdfs.serverless.invoking.InvokerUtilities.serializableToBase64String;
 
@@ -67,7 +69,7 @@ class BPServiceActor implements Runnable {
   /**
    * Used to invoke serverless name nodes.
    */
-  private final ServerlessInvokerBase<JsonObject> serverlessInvoker;
+  private final ServerlessInvokerBase serverlessInvoker;
 
   static final Log LOG = DataNode.LOG;
   final InetSocketAddress nnAddr;
@@ -97,7 +99,7 @@ class BPServiceActor implements Runnable {
     this.serverlessInvoker = ServerlessInvokerFactory.getServerlessInvoker(dn.getDnConf().serverlessPlatformName);
     this.serverlessInvoker.setIsClientInvoker(false);
     this.serverlessInvoker.setConfiguration(dn.getDnConf().getConf(), "DN-" + dn.getXferAddress() +
-            ":" + dn.getXferPort());
+            ":" + dn.getXferPort(), dn.getDnConf().serverlessEndpoint);
     scheduler = new Scheduler(dnConf.heartBeatInterval);
   }
 
@@ -163,18 +165,13 @@ class BPServiceActor implements Runnable {
 
         fsArgs.put("uuid", "N/A"); // This will always result in a groupId of 0 being assigned...
 
-        JsonObject responseJson = serverlessInvoker.invokeNameNodeViaHttpPost(
-                "versionRequest",
-                dnConf.serverlessEndpoint,
-                null,
-                fsArgs,
-                null,
-                -1
-        );
+        JsonObject response = ServerlessInvokerBase.issueHttpRequestWithRetries(
+                serverlessInvoker, "versionRequest", dnConf.serverlessEndpoint,
+                null, fsArgs, null, -1);
 
-        LOG.info("responseJson = " + responseJson.toString());
+        LOG.info("responseJson = " + response.toString());
 
-        Object result = serverlessInvoker.extractResultFromJsonResponse(responseJson);
+        Object result = serverlessInvoker.extractResultFromJsonResponse(response);
         if (result != null)
           nsInfo = (NamespaceInfo)result;
 

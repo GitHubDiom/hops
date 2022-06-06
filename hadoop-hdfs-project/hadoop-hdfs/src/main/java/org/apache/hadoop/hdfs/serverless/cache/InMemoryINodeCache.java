@@ -1,5 +1,9 @@
 package org.apache.hadoop.hdfs.serverless.cache;
 
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.RemovalListener;
+import com.google.common.hash.Hashing;
 import org.apache.commons.collections4.trie.PatriciaTrie;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
@@ -7,41 +11,41 @@ import org.apache.hadoop.hdfs.server.namenode.INode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
-/**
- *
- * ** UPDATE**:
- * WE NOW CACHE BY THE FULLY-QUALIFIED PATH OF THE INODE, NOT THE PARENT'S ID.
- *
- * Figure out what the various tables would be called in NDB.
- * The cache (or maybe some other object) will create and maintain ClusterJ Event and EventOperation objects
- * associated with those tables. When event notifications are received, the NameNode will optionally update its
- * cache. May need to add a mechanism for NameNodes to determine if they were the source of the event being fired,
- * as NameNodes should not have to go back to NDB and re-read data that they just wrote.
- *
- * If such a mechanism is not already possible with the current way events are implemented, then events may need
- * to be augmented to somehow relay the identity of the client who last performed the write operation. That may not
- * be feasible, however. In that case, a simpler solution may be to just add a column in the associated tables that
- * denotes the last person to write the data. Then the Event listener can just compare the new value of that column
- * against the local ID, and if they're the same, then the Event listener knows that this NameNode was the source of
- * the Event.
- *
- * In fact, that second solution is probably the best/easiest.
- */
+import static com.google.common.hash.Hashing.consistentHash;
+import static io.hops.transaction.context.EntityContext.*;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.*;
 
 /**
  * Used by Serverless NameNodes to store and retrieve cached metadata.
+ *
+ * We partition the namespace by parent INode ID (and/or possibly the full path to the parent directory).
+ * In this way, we basically map terminal INodes (i.e., files) to particular directories. Single INode operations
+ * targeting these INodes will issue INVs to the deployment responsible for caching that terminal INode (i.e., file).
+ * This will just invalidate that terminal INode, leaving the rest of the path intact.
+ * If a subtree operation is performed, then a subtree/prefix INV will be issued to all NNs responsible for
+ * caching some terminal INode in the subtree. This will invalidate all INodes along the path, ensuring that no
+ * deployments will serve stale metadata.
  */
 public class InMemoryINodeCache {
     public static final Logger LOG = LoggerFactory.getLogger(InMemoryINodeCache.class);
 
-    private static final int DEFAULT_MAX_ENTRIES = 30_000;         // Default maximum capacity.
-    private static final float DEFAULT_LOAD_FACTOR = 0.75f;         // Default load factor.
+    /**
+     * Default load factor used for the INode ID to full path cache.
+     */
+    private static final float DEFAULT_LOAD_FACTOR = 0.75f;
 
+    /**
+     * Used to synchronize access to the PatriciaTrie {@code prefixMetadataCache} variable.
+     * Multiple threads can access the PatriciaTrie concurrently, so we must synchronize access.
+     * We use a RW lock since much of the time, the threads will just be concurrently reading.
+     */
     private final ReadWriteLock _mutex = new ReentrantReadWriteLock(true);
 
     /**
@@ -52,14 +56,21 @@ public class InMemoryINodeCache {
     private final PatriciaTrie<INode> prefixMetadataCache;
 
     /**
-     * Cache that is used when not using a prefix.
+     * Used to control the size of the trie structure. This has a capacity, and entries are automatically
+     * evicted when we're at-capacity. We can use the eviction listener to then remove those entries
+     * from the trie data structure and the other caches (e.g., ID to full path, parent ID + local name, etc.)
      */
-    private final ConcurrentHashMap<String, INode> fullPathMetadataCache;
+    private final Cache<String, INode> cache;
+
+//    /**
+//     * Cache that is used when not using a prefix.
+//     */
+//    private final ConcurrentHashMap<String, INode> fullPathMetadataCache;
 
     /**
-     * Mapping between INode IDs and their names.
+     * Mapping between INode IDs and their fully-qualified paths.
      */
-    private final ConcurrentHashMap<Long, String> idToNameMapping;
+    private final ConcurrentHashMap<Long, String> idToFullPathMap;
 
     /**
      * Mapping between keys of the form [PARENT_ID][LOCAL_NAME], which is how some INodes are
@@ -72,26 +83,55 @@ public class InMemoryINodeCache {
 
     private final boolean enabled;
 
+    private final int deploymentNumber;
+
+    private final int numDeployments;
+
     /**
      * Create an LRU Metadata Cache using the default maximum capacity and load factor values.
      */
-    public InMemoryINodeCache(Configuration conf) {
-        this(conf, DEFAULT_MAX_ENTRIES, DEFAULT_LOAD_FACTOR);
+    public InMemoryINodeCache(Configuration conf, int deploymentNumber) {
+        this(conf, DEFAULT_LOAD_FACTOR, deploymentNumber);
     }
 
     /**
      * Create an LRU Metadata Cache using a specified maximum capacity and load factor.
      */
-    public InMemoryINodeCache(Configuration conf, int capacity, float loadFactor) {
+    public InMemoryINodeCache(Configuration conf, float loadFactor, int deploymentNumber) {
         //this.invalidatedKeys = new HashSet<>();
-        this.idToNameMapping = new ConcurrentHashMap<>(capacity, loadFactor);
-        this.fullPathMetadataCache = new ConcurrentHashMap<>(capacity, loadFactor);
-        this.parentIdPlusLocalNameToFullPathMapping = new ConcurrentHashMap<>(capacity, loadFactor);
+        /**
+         * Maximum elements in INode cache.
+         */
+        int cacheCapacity = conf.getInt(SERVERLESS_METADATA_CACHE_CAPACITY, SERVERLESS_METADATA_CACHE_CAPACITY_DEFAULT);
+        this.numDeployments = conf.getInt(SERVERLESS_MAX_DEPLOYMENTS, SERVERLESS_MAX_DEPLOYMENTS_DEFAULT);
+        this.idToFullPathMap = new ConcurrentHashMap<>(cacheCapacity, loadFactor);
+        this.parentIdPlusLocalNameToFullPathMapping = new ConcurrentHashMap<>(cacheCapacity, loadFactor);
+        this.deploymentNumber = deploymentNumber;
+
+        // this.fullPathMetadataCache = new ConcurrentHashMap<>(capacity, loadFactor);
+
         /**
          * This is the main cache, along with the metadataTrie variable. We use this when we want to grab a single
          * INode by its full path.
          */
         this.prefixMetadataCache = new PatriciaTrie<>();
+        this.cache = Caffeine.newBuilder()
+                .initialCapacity(cacheCapacity)
+                .evictionListener((RemovalListener<String, INode>) (fullPath, iNode, removalCause) -> {
+                    _mutex.writeLock().lock();
+                    try {
+                        prefixMetadataCache.remove(fullPath);
+                    } finally {
+                        _mutex.writeLock().unlock();
+                    }
+
+//                    if (fullPath != null)
+//                        fullPathMetadataCache.remove(fullPath);
+
+                    if (iNode != null)
+                        idToFullPathMap.remove(iNode.getId());
+                })
+                .build();
         this.enabled = conf.getBoolean(DFSConfigKeys.SERVERLESS_METADATA_CACHE_ENABLED,
                 DFSConfigKeys.SERVERLESS_METADATA_CACHE_ENABLED_DEFAULT);
     }
@@ -107,17 +147,44 @@ public class InMemoryINodeCache {
     /**
      * Record a cache hit.
      */
-    protected void cacheHit() {
+    protected void cacheHit(String path) {
         int currentHits = threadLocalCacheHits.get();
         threadLocalCacheHits.set(currentHits + 1);
+
+        if (LOG.isTraceEnabled()) {
+            LOG.trace(ANSI_GREEN + "[CACHE HIT]" + ANSI_RESET + " INode = '" + path + "'");
+        }
     }
 
     /**
      * Record a cache miss.
      */
-    protected void cacheMiss() {
+    protected void cacheMiss(String path) {
         int currentMisses = threadLocalCacheMisses.get();
         threadLocalCacheMisses.set(currentMisses + 1);
+
+        if (LOG.isTraceEnabled()) LOG.trace(ANSI_RED + "[CACHE MISS]" + ANSI_RESET + " INode path = '" + path + "'");
+    }
+
+    /**
+     * Record a cache miss.
+     */
+    protected void cacheMiss(String localName, long parentId) {
+        int currentMisses = threadLocalCacheMisses.get();
+        threadLocalCacheMisses.set(currentMisses + 1);
+        if (LOG.isTraceEnabled()) LOG.trace(ANSI_RED + "[CACHE MISS]" + ANSI_RESET + " INode LocalName = '" +
+                localName + "', ParentID = " + parentId);
+    }
+
+    /**
+     * Record a cache hit.
+     */
+    protected void cacheMiss(long id) {
+        int currentHits = threadLocalCacheHits.get();
+        threadLocalCacheHits.set(currentHits + 1);
+
+        if (LOG.isTraceEnabled())
+            LOG.trace(ANSI_RED + "[CACHE MISS]" + ANSI_RESET + " INode ID = " + id);
     }
 
     /**
@@ -134,35 +201,21 @@ public class InMemoryINodeCache {
 
         long s = System.currentTimeMillis();
 
-        //_mutex.readLock().lock();
-//        if (LOG.isDebugEnabled()) LOG.debug("Acquired metadata cache read lock in " +
-//                (System.currentTimeMillis() - s) + " ms.");
         try {
-            long s1 = System.currentTimeMillis();
-            INode returnValue = fullPathMetadataCache.get(key);
-            long t2 = System.currentTimeMillis();
+            // INode returnValue = fullPathMetadataCache.get(key);
+            INode returnValue = cache.getIfPresent(key);
 
             if (returnValue == null)
-                cacheMiss();
+                cacheMiss(key);
             else
-                cacheHit();
-
-            long t3 = System.currentTimeMillis();
+                cacheHit(key);
 
             return returnValue;
         } finally {
-            //_mutex.readLock().unlock();
             long t4 = System.currentTimeMillis();
             if (LOG.isTraceEnabled() && t4 - s > 10) LOG.trace("Checked cache by path for INode '" + key + "' in " +
                     (t4 - s) + " ms. [1]");
         }
-    }
-
-    /**
-     * Generate a unique (hopefully) hash code we can use instead of concatenating Strings together.
-     */
-    private int computeParentIdLocalNameHash(long parentId, String localName) {
-        return (int)(parentId ^ localName.hashCode());
     }
 
     /**
@@ -179,26 +232,20 @@ public class InMemoryINodeCache {
             return null;
 
         long s = System.currentTimeMillis();
-
-//        _mutex.readLock().lock();
-//        if (LOG.isDebugEnabled()) LOG.debug("Acquired metadata cache read lock in " +
-//                (System.currentTimeMillis() - s) + " ms.");
         try {
-
             String parentIdPlusLocalName = parentId + localName;
-            // int parentIdPlusLocalName = computeParentIdLocalNameHash(parentId, localName);
             String key = parentIdPlusLocalNameToFullPathMapping.getOrDefault(parentIdPlusLocalName, null);
 
             if (key != null)
                 return getByPath(key);
-            cacheMiss();
+
+            cacheMiss(localName, parentId);
             return null;
         } finally {
-            //_mutex.readLock().unlock();
-
-            long t = System.currentTimeMillis();
-            if (LOG.isTraceEnabled() && t - s > 10) LOG.trace("Checked cache by parent ID and local name for INode '" + localName +
-                    "' in " + (t - s) + " ms.");
+            if (LOG.isTraceEnabled()) {
+                long t = System.currentTimeMillis();
+                LOG.trace("Checked cache by parent ID and local name for INode '" + localName + "' in " + (t - s) + " ms.");
+            }
         }
     }
 
@@ -215,23 +262,19 @@ public class InMemoryINodeCache {
             return null;
 
         long s = System.currentTimeMillis();
-//        _mutex.readLock().lock();
-//        if (LOG.isDebugEnabled()) LOG.debug("Acquired metadata cache read lock in " +
-//                (System.currentTimeMillis() - s) + " ms.");
         try {
-            if (idToNameMapping.containsKey(iNodeId)) {
-                String key = idToNameMapping.get(iNodeId);
+            if (idToFullPathMap.containsKey(iNodeId)) {
+                String key = idToFullPathMap.get(iNodeId);
                 return getByPath(key);
             }
 
-            cacheMiss();
+            cacheMiss(iNodeId);
             return null;
         } finally {
-//            _mutex.readLock().unlock();
-
-            long t = System.currentTimeMillis();
-            if (LOG.isTraceEnabled() && t - s > 10) LOG.trace("Checked cache by ID for INode " + iNodeId + " in " +
-                    (System.currentTimeMillis() - s) + " ms.");
+            if (LOG.isTraceEnabled()) {
+                long t = System.currentTimeMillis();
+                LOG.trace("Checked cache by ID for INode " + iNodeId + " in " + (t - s) + " ms.");
+            }
         }
     }
 
@@ -249,6 +292,14 @@ public class InMemoryINodeCache {
             throw new IllegalArgumentException("INode Metadata Cache does NOT support null values. Associated key: " + key);
         long s = System.currentTimeMillis();
 
+//        if (consistentHash(Hashing.md5().hashString(getPathToCache(key)), numDeployments) != deploymentNumber) {
+//            if (LOG.isTraceEnabled()) {
+//                long t = System.currentTimeMillis();
+//                LOG.trace("Rejected INode '" + key + "' (ID=" + iNodeId + ") from being cached in " + (t - s) + " ms.");
+//            }
+//            return null;
+//        }
+
         _mutex.writeLock().lock();
         INode returnValue;
         try {
@@ -256,20 +307,23 @@ public class InMemoryINodeCache {
             returnValue = prefixMetadataCache.put(key, value);
         } finally {
             _mutex.writeLock().unlock();
-            long t = System.currentTimeMillis();
-            if (LOG.isTraceEnabled() && t - s > 10) LOG.trace("Stored INode '" + key + "' (ID=" + iNodeId + ") in cache in " +
-                    (t - s) + " ms.");
+            if (LOG.isTraceEnabled()) {
+                long t = System.currentTimeMillis();
+                LOG.trace("Stored INode '" + key + "' (ID=" + iNodeId + ") in cache in " + (t - s) + " ms.");
+            }
         }
 
         String parentIdPlusLocalName = value.getParentId() + value.getLocalName();
-        // int parentIdPlusLocalName = computeParentIdLocalNameHash(value.getParentId(), value.getLocalName());
         parentIdPlusLocalNameToFullPathMapping.put(parentIdPlusLocalName, key);
 
+        // Put into the Caffeine cache. We use this to implement the LRU policy.
+        cache.put(key, value);
+
         // Create a mapping between the INode ID and the path.
-        idToNameMapping.put(iNodeId, key);
+        idToFullPathMap.put(iNodeId, key);
 
         // Cache by full-path.
-        fullPathMetadataCache.put(key, value);
+        // fullPathMetadataCache.put(key, value);
 
         return returnValue;
     }
@@ -289,7 +343,7 @@ public class InMemoryINodeCache {
             } else if (key instanceof Long) {
                 // If the key is a long, we need to check if we've mapped this long to a String key. If so,
                 // then we can get the string version and continue as before.
-                String keyAsStr = idToNameMapping.getOrDefault((Long) key, null);
+                String keyAsStr = idToFullPathMap.getOrDefault((Long) key, null);
                 return keyAsStr != null && prefixMetadataCache.containsKey(keyAsStr);
             }
 
@@ -337,7 +391,7 @@ public class InMemoryINodeCache {
         _mutex.readLock().lock();
         try {
             // If we don't have a mapping for this key, then this will return null, and this function will return false.
-            String keyAsStr = idToNameMapping.getOrDefault(inodeId, null);
+            String keyAsStr = idToFullPathMap.getOrDefault(inodeId, null);
 
             // Returns true if we are able to resolve the NameNode ID to a string-typed key, that key is not
             // invalidated, and we're actively caching the key.
@@ -357,8 +411,8 @@ public class InMemoryINodeCache {
     protected boolean invalidateKey(long inodeId) {
         _mutex.writeLock().lock();
         try  {
-            if (idToNameMapping.containsKey(inodeId)) {
-                String key = idToNameMapping.get(inodeId);
+            if (idToFullPathMap.containsKey(inodeId)) {
+                String key = idToFullPathMap.get(inodeId);
 
                 return invalidateKeyInternal(key, false);
             }
@@ -375,7 +429,7 @@ public class InMemoryINodeCache {
      * This mapping is not guaranteed to be up-to-date (i.e., if cache has been invalidated, then this could be wrong).
      */
     protected String getNameFromId(long inodeId) {
-        return idToNameMapping.get(inodeId);
+        return idToFullPathMap.get(inodeId);
     }
 
     /**
@@ -408,7 +462,8 @@ public class InMemoryINodeCache {
         try {
             if (skipCheck || containsKeySkipInvalidCheck(key)) {
                 prefixMetadataCache.remove(key);
-                fullPathMetadataCache.remove(key);
+                cache.invalidate(key);
+                // fullPathMetadataCache.remove(key);
                 return true;
             }
 
@@ -433,9 +488,9 @@ public class InMemoryINodeCache {
             _mutex.writeLock().unlock();
             if (LOG.isTraceEnabled()) LOG.trace("Invalidated entire cache in " + (System.currentTimeMillis() - s) + " ms.");
         }
-        idToNameMapping.clear();
-        fullPathMetadataCache.clear();
+        idToFullPathMap.clear();
         parentIdPlusLocalNameToFullPathMapping.clear();
+        // fullPathMetadataCache.clear();
     }
 
     /**

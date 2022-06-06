@@ -1,4 +1,4 @@
-package org.apache.hadoop.hdfs.serverless.tcpserver;
+package org.apache.hadoop.hdfs.serverless.userserver;
 
 /**
  * Encapsulates the information needed to communicate with a Serverless HopsFS client/user via TCP.
@@ -65,6 +65,8 @@ public class ServerlessHopsFSClient {
     public int getUdpPort() { return udpPort; }
 
     public boolean getUdpEnabled() { return udpEnabled; }
+
+    public String getTcpString() { return clientIp + ":" + tcpPort; }
 
     @Override
     public boolean equals(Object obj) {

@@ -1,4 +1,4 @@
-package org.apache.hadoop.hdfs.serverless.operation.execution;
+package org.apache.hadoop.hdfs.serverless.execution;
 
 import io.hops.exception.StorageException;
 import io.hops.metadata.HdfsStorageFactory;
@@ -6,10 +6,10 @@ import io.hops.metadata.hdfs.dal.WriteAcknowledgementDataAccess;
 import io.hops.metadata.hdfs.entity.WriteAcknowledgement;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdfs.server.namenode.ServerlessNameNode;
-import org.apache.hadoop.hdfs.serverless.OpenWhiskHandler;
-import org.apache.hadoop.hdfs.serverless.operation.execution.results.NameNodeResult;
-import org.apache.hadoop.hdfs.serverless.operation.execution.results.NameNodeResultWithMetrics;
-import org.apache.hadoop.hdfs.serverless.operation.execution.taskarguments.TaskArguments;
+import org.apache.hadoop.hdfs.serverless.execution.results.NameNodeResult;
+import org.apache.hadoop.hdfs.serverless.execution.results.NameNodeResultWithMetrics;
+import org.apache.hadoop.hdfs.serverless.execution.results.NullResult;
+import org.apache.hadoop.hdfs.serverless.execution.taskarguments.TaskArguments;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -44,24 +44,10 @@ public class ExecutionManager {
      */
     private final ServerlessNameNode serverlessNameNodeInstance;
 
-//    /**
-//     * All tasks that are currently being executed. For now, we only ever execute one task at a time.
-//     */
-    //private final ConcurrentHashMap<String, FileSystemTask<Serializable>> currentlyExecutingTasks;
-    //private final Cache<String, FileSystemTask<Serializable>> currentlyExecutingTasks;
-    //private Set<String> currentlyExecutingTasks;
-
-//    /**
-//     * All tasks that have been executed by this worker thread.
-//     */
-    //private final ConcurrentHashMap<String, FileSystemTask<Serializable>> completedTasks;
-    //private final Cache<String, FileSystemTask<Serializable>> completedTasks;
-    //private Set<String> completedTasks;
-
     /**
      * All the tasks we're either executing or have successfully executed.
      */
-    private Set<String> seenTasks;
+    private final Set<String> seenTasks;
 
     /**
      * Cache of previously-computed results. These results are kept in-memory for a configurable period of time
@@ -121,7 +107,15 @@ public class ExecutionManager {
      * We only need/want to trigger a GC once during an idle interval.
      * This flag indicates whether we've triggered one or not during an idle interval.
      */
-    private volatile boolean gcTriggeredDuringThisIdleInterval = false;
+    // private volatile boolean gcTriggeredDuringThisIdleInterval = false;
+
+    /**
+     * The number of GCs that have occurred during this idle interval. Occasionally, it seems like one GC
+     * will not always get everything? This usually isn't the case, but I've noticed it while profiling.
+     */
+    private int numGCsTriggeredDuringThisIdleInterval = 0;
+
+    private final int maxGCsDuringSingleIdleInterval = 2;
 
     /**
      * We only want to perform NDB updates roughly every heartbeat interval. The update thread wakes up more
@@ -198,19 +192,24 @@ public class ExecutionManager {
             // to true, and thus we're actually changing its value by setting it to false. If it is already
             // set to false, then we do not need to print a message.
             if (LOG.isDebugEnabled()) {
-                if (gcTriggeredDuringThisIdleInterval)
-                    LOG.debug("Resetting the value of 'gcTriggeredDuringThisIdleInterval'.");
+                // if (gcTriggeredDuringThisIdleInterval)
+                if (numGCsTriggeredDuringThisIdleInterval < maxGCsDuringSingleIdleInterval)
+                    //LOG.debug("Resetting the value of 'gcTriggeredDuringThisIdleInterval'.");
+                    LOG.debug("Resetting the value of 'numGCsTriggeredDuringThisIdleInterval'.");
             }
 
-            gcTriggeredDuringThisIdleInterval = false;
+            // gcTriggeredDuringThisIdleInterval = false;
+            numGCsTriggeredDuringThisIdleInterval = 0;
         }
 
         // Have we been idle long enough to warrant a GC? If so, then trigger one,
         // assuming we haven't already triggered a GC in this same idle interval.
-        if (System.currentTimeMillis() - lastTaskExecutedTs > idleGcThreshold && !gcTriggeredDuringThisIdleInterval) {
+        if (System.currentTimeMillis() - lastTaskExecutedTs > idleGcThreshold &&
+                numGCsTriggeredDuringThisIdleInterval < maxGCsDuringSingleIdleInterval) {
             LOG.debug("Manually triggering garbage collection!");
             System.gc();
-            gcTriggeredDuringThisIdleInterval = true;
+            numGCsTriggeredDuringThisIdleInterval++;
+            // gcTriggeredDuringThisIdleInterval = true;
         }
 
         lastTaskExecutedTimestampCopy = lastTaskExecutedTs;
@@ -228,18 +227,19 @@ public class ExecutionManager {
      */
     public void tryExecuteTask(String taskId, String operationName, TaskArguments taskArguments, boolean forceRedo,
                                NameNodeResultWithMetrics workerResult, boolean http) {
-        boolean duplicate = isTaskDuplicate(taskId);
+//        boolean duplicate = isTaskDuplicate(taskId);
 
-        if (duplicate && !forceRedo) {
-            // Technically we aren't dequeue-ing the task now, but we will never enqueue it since it is a duplicate.
-            workerResult.addResult(new DuplicateRequest("TCP", taskId), true);
-            workerResult.setDequeuedTime(System.currentTimeMillis());
-            return;
-        } else {
-            // currentlyExecutingTasks.put(taskId, task);
-            // currentlyExecutingTasks.add(taskId);
-            seenTasks.add(taskId);
-        }
+        seenTasks.add(taskId);
+//        if (duplicate && !forceRedo) {
+//            // Technically we aren't dequeue-ing the task now, but we will never enqueue it since it is a duplicate.
+//            workerResult.addResult(new DuplicateRequest("TCP", taskId), true);
+//            workerResult.setDequeuedTime(System.currentTimeMillis());
+//            return;
+//        } else {
+//            // currentlyExecutingTasks.put(taskId, task);
+//            // currentlyExecutingTasks.add(taskId);
+//            seenTasks.add(taskId);
+//        }
 
         LOG.info("Executing task " + taskId + ", operation: " + operationName + " now.");
 
@@ -272,21 +272,21 @@ public class ExecutionManager {
         }
 
         // If this task was submitted via HTTP, then attempt to create a deployment mapping.
-        if (http) {
-            try {
-                long start = System.currentTimeMillis();
-                // Check if a function mapping should be created and returned to the client.
-                OpenWhiskHandler.tryCreateDeploymentMapping(workerResult, taskArguments, serverlessNameNodeInstance);
-                long end = System.currentTimeMillis();
-
-                if (LOG.isTraceEnabled())
-                    LOG.trace("Created function mapping for request " + taskId + " in " + (end - start) + " ms.");
-            } catch (IOException ex) {
-                LOG.error("Encountered IOException while trying to create function mapping for task " +
-                        taskId + ":", ex);
-                workerResult.addException(ex);
-            }
-        }
+//        if (http) {
+//            try {
+//                long start = System.currentTimeMillis();
+//                // Check if a function mapping should be created and returned to the client.
+//                OpenWhiskHandler.tryCreateDeploymentMapping(workerResult, taskArguments, serverlessNameNodeInstance);
+//                long end = System.currentTimeMillis();
+//
+//                if (LOG.isTraceEnabled())
+//                    LOG.trace("Created function mapping for request " + taskId + " in " + (end - start) + " ms.");
+//            } catch (IOException ex) {
+//                LOG.error("Encountered IOException while trying to create function mapping for task " +
+//                        taskId + ":", ex);
+//                workerResult.addException(ex);
+//            }
+//        }
 
         // The TX events are ThreadLocal, so we'll only get events generated by our thread.
         if (txEventsEnabled)
@@ -305,17 +305,19 @@ public class ExecutionManager {
      */
     public void tryExecuteTask(String taskId, String operationName, TaskArguments taskArguments,
                                boolean forceRedo, NameNodeResult workerResult, boolean http) {
-        boolean duplicate = isTaskDuplicate(taskId);
+//        boolean duplicate = isTaskDuplicate(taskId);
+//
+//        if (duplicate && !forceRedo) {
+//            // TODO: Just mark the request as duplicate using a boolean flag.
+//            workerResult.addResult(new DuplicateRequest("TCP", taskId), true);
+//            return;
+//        } else {
+//            // currentlyExecutingTasks.put(taskId, task);
+//            // currentlyExecutingTasks.add(taskId);
+//            seenTasks.add(taskId);
+//        }
 
-        if (duplicate && !forceRedo) {
-            // TODO: Just mark the request as duplicate using a boolean flag.
-            workerResult.addResult(new DuplicateRequest("TCP", taskId), true);
-            return;
-        } else {
-            // currentlyExecutingTasks.put(taskId, task);
-            // currentlyExecutingTasks.add(taskId);
-            seenTasks.add(taskId);
-        }
+        seenTasks.add(taskId);
 
         LOG.info("Executing task " + taskId + ", operation: " + operationName + " now.");
 
@@ -342,21 +344,21 @@ public class ExecutionManager {
         }
 
         // If this task was submitted via HTTP, then attempt to create a deployment mapping.
-        if (http) {
-            try {
-                long start = System.currentTimeMillis();
-                // Check if a function mapping should be created and returned to the client.
-                OpenWhiskHandler.tryCreateDeploymentMapping(workerResult, taskArguments, serverlessNameNodeInstance);
-                long end = System.currentTimeMillis();
-
-                if (LOG.isTraceEnabled())
-                    LOG.trace("Created function mapping for request " + taskId + " in " + (end - start) + " ms.");
-            } catch (IOException ex) {
-                LOG.error("Encountered IOException while trying to create function mapping for task " +
-                        taskId + ":", ex);
-                workerResult.addException(ex);
-            }
-        }
+//        if (http) {
+//            try {
+//                long start = System.currentTimeMillis();
+//                // Check if a function mapping should be created and returned to the client.
+//                OpenWhiskHandler.tryCreateDeploymentMapping(workerResult, taskArguments, serverlessNameNodeInstance);
+//                long end = System.currentTimeMillis();
+//
+//                if (LOG.isTraceEnabled())
+//                    LOG.trace("Created function mapping for request " + taskId + " in " + (end - start) + " ms.");
+//            } catch (IOException ex) {
+//                LOG.error("Encountered IOException while trying to create function mapping for task " +
+//                        taskId + ":", ex);
+//                workerResult.addException(ex);
+//            }
+//        }
     }
 
 

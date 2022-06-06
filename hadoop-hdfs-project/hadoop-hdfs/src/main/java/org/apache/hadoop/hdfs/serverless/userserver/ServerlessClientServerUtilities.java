@@ -1,4 +1,4 @@
-package org.apache.hadoop.hdfs.serverless.tcpserver;
+package org.apache.hadoop.hdfs.serverless.userserver;
 
 import com.esotericsoftware.kryo.Kryo;
 import io.hops.exception.TransientDeadLockException;
@@ -17,13 +17,14 @@ import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.protocol.*;
 import org.apache.hadoop.hdfs.security.token.block.BlockTokenIdentifier;
 import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
-import org.apache.hadoop.hdfs.serverless.operation.ActiveServerlessNameNode;
-import org.apache.hadoop.hdfs.serverless.operation.ActiveServerlessNameNodeList;
-import org.apache.hadoop.hdfs.serverless.operation.execution.DuplicateRequest;
-import org.apache.hadoop.hdfs.serverless.operation.execution.results.NameNodeResult;
-import org.apache.hadoop.hdfs.serverless.operation.execution.NullResult;
-import org.apache.hadoop.hdfs.serverless.operation.execution.results.NameNodeResultWithMetrics;
-import org.apache.hadoop.hdfs.serverless.operation.execution.results.ServerlessFunctionMapping;
+import org.apache.hadoop.hdfs.serverless.exceptions.TcpRequestCancelledException;
+import org.apache.hadoop.hdfs.serverless.consistency.ActiveServerlessNameNode;
+import org.apache.hadoop.hdfs.serverless.consistency.ActiveServerlessNameNodeList;
+import org.apache.hadoop.hdfs.serverless.execution.results.DuplicateRequest;
+import org.apache.hadoop.hdfs.serverless.execution.results.NameNodeResult;
+import org.apache.hadoop.hdfs.serverless.execution.results.NullResult;
+import org.apache.hadoop.hdfs.serverless.execution.results.NameNodeResultWithMetrics;
+import org.apache.hadoop.hdfs.serverless.execution.results.ServerlessFunctionMapping;
 import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.security.token.TokenRenewer;
 
@@ -67,7 +68,7 @@ public class ServerlessClientServerUtilities {
 
         kryo.register(NameNodeResult.class);
         kryo.register(ServerlessFunctionMapping.class);
-        kryo.register(TcpRequestPayload.class);
+        kryo.register(TcpUdpRequestPayload.class);
         kryo.register(NameNodeResultWithMetrics.class);
         kryo.register(TransactionEvent.class);
         kryo.register(TransactionAttempt.class);
@@ -101,6 +102,7 @@ public class ServerlessClientServerUtilities {
         kryo.register(CryptoProtocolVersion.class);
         kryo.register(CipherSuite.class);
         kryo.register(FsAction.class);
+        kryo.register(TcpRequestCancelledException.class);
         kryo.register(NullResult.class);
         kryo.register(DuplicateRequest.class);
         kryo.register(FileNotFoundException.class);

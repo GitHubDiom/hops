@@ -25,6 +25,7 @@ import io.hops.metadata.HdfsStorageFactory;
 import io.hops.metadata.hdfs.dal.OngoingSubTreeOpsDataAccess;
 import io.hops.transaction.handler.HDFSOperationType;
 import io.hops.transaction.handler.LightWeightRequestHandler;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.hdfs.DFSUtil;
 import org.apache.hadoop.hdfs.protocol.UnresolvedPathException;
 import org.apache.hadoop.hdfs.server.namenode.INode;
@@ -36,7 +37,6 @@ import org.apache.hadoop.ipc.RetriableException;
 import java.io.IOException;
 import java.util.*;
 import org.apache.hadoop.hdfs.protocol.HdfsConstantsClient;
-import org.apache.hadoop.util.StringUtils;
 
 public class INodeLock extends BaseINodeLock {
   
@@ -113,7 +113,7 @@ public class INodeLock extends BaseINodeLock {
        */
       Arrays.sort(paths);
 
-      if (LOG.isTraceEnabled()) LOG.trace("Acquiring INode locks on the following paths: " + StringUtils.join(", ", paths));
+      if (LOG.isTraceEnabled()) LOG.trace("Acquiring INode locks on the following paths: " + StringUtils.join(paths, ", "));
 
       acquirePathsINodeLocks();
     } else {
@@ -170,31 +170,14 @@ public class INodeLock extends BaseINodeLock {
 
       List<INode> resolvedINodes = null;
 
-      // We only use our local, in-memory metadata cache for read operations.
-//      if (lockType == TransactionLockTypes.INodeLockType.READ ||
-//              lockType == TransactionLockTypes.INodeLockType.READ_COMMITTED) {
-//        resolvedINodes = resolveUsingServerlessMetadataCache(path, true);
-//
-//        if (resolvedINodes == null)
-//          LOG.debug("Failed to completely resolve the path using the in-memory metadata cache. " +
-//                  "Falling back to INode Hint Cache or recursive resolution.");
-//        else {
-//          LOG.debug("Successfully resolved entirety of path using in-memory metadata cache.");
-//          addPathINodes(path, resolvedINodes);
-//        }
-//      }
-
-      // Added clause 'resolvedINodes == null' as we do not need to bother with the INode Hint Cache
-      // if we fully resolved the path using our local, in-memory metadata cache.
-      //if (resolvedINodes == null && getDefaultInodeLockType() == TransactionLockTypes.INodeLockType.READ_COMMITTED) {
       if (getDefaultInodeLockType() == TransactionLockTypes.INodeLockType.READ_COMMITTED) {
-        //if (LOG.isDebugEnabled()) LOG.debug("Attempting to resolve INodes using INode Hint Cache.");
+        if (LOG.isTraceEnabled()) LOG.trace("Attempting to resolve path '" + path + "' using INode Hint Cache.");
         // Batching only works in READ_COMMITTED mode. If locking is enabled then it can lead to deadlocks.
         resolvedINodes = resolveUsingINodeHintCache(path);
       }
 
       if (resolvedINodes == null) {
-        //if (LOG.isDebugEnabled()) LOG.debug("Path '" + path + "' was either not in INode Hint Cache or we couldn't use the cache.");
+        if (LOG.isTraceEnabled()) LOG.trace("Path '" + path + "' was either not in INode Hint Cache or we couldn't use the cache.");
         // path not found in the cache
         // set random partition key if enabled
         if (setRandomParitionKeyEnabled) {
@@ -280,17 +263,25 @@ public class INodeLock extends BaseINodeLock {
     }
     List<INode> resolvedINodes = cacheResolver.fetchINodes(lockType, path, resolveLink);
     if (resolvedINodes != null) {
-      //if (LOG.isDebugEnabled()) LOG.debug("Resolved " + resolvedINodes.size() + " INode(s) via INode Hint Cache.");
+      if (LOG.isTraceEnabled()) LOG.trace("Resolved " + resolvedINodes.size() + " INode(s) via INode Hint Cache.");
 
       for (INode iNode : resolvedINodes) {
         if(iNode!=null){
           checkSubtreeLock(iNode);
         }
       }
+
+      if (INode.getPathComponents(path).length != INode.getNumPathComponents(path)) {
+        LOG.error("INode.getPathComponents('" + path + "').length does NOT equal INode.getNumPathComponents('" +
+                path + "')...");
+        LOG.error(INode.getPathComponents(path).length + " =/= " + INode.getNumPathComponents(path));
+        throw new IllegalStateException("INode.getNumPathComponents() failed to be correct.");
+      }
+
       //handleLockUpgrade(resolvedINodes, INode.getPathComponents(path), path);
       handleLockUpgrade(resolvedINodes, INode.getNumPathComponents(path), path);
     } else {
-      //if (LOG.isDebugEnabled()) LOG.debug("Failed to resolve any INodes via INode Hint Cache.");
+      if (LOG.isTraceEnabled()) LOG.trace("Failed to resolve any INodes via INode Hint Cache.");
     }
 
     return resolvedINodes;
@@ -299,8 +290,12 @@ public class INodeLock extends BaseINodeLock {
   private List<INode> acquireINodeLockByPath(String path)
           throws IOException {
     List<INode> resolvedINodes = new ArrayList<>();
-    //byte[][] components = INode.getPathComponents(path);
+    byte[][] componentsBytes = INode.getPathComponents(path);
     String[] components = INode.getComponentsAsStringArray(path);
+
+    if (componentsBytes.length != components.length)
+      throw new IllegalStateException("componentsBytes.length (" + componentsBytes.length +
+              ") != components.length (" + components.length + ")");
 
     INode currentINode;
     if (isRootTarget(components)) {
@@ -328,6 +323,10 @@ public class INodeLock extends BaseINodeLock {
       TransactionLockTypes.INodeLockType currentINodeLock =
           identifyLockType(lockType, resolver.getCount() + 1, components);
       setINodeLockType(currentINodeLock);
+      if (LOG.isTraceEnabled()) {
+        if (currentINode != null) LOG.trace("Current INode: " + currentINode.getLocalName() + " (id=" + currentINode.getId() + "). Resolving next component with lock " + currentINodeLock.name() + ".");
+        else LOG.trace("Current INode: null. Resolving next component with lock " + currentINodeLock.name() + ".");
+      }
       currentINode = resolver.next();
       if (currentINode != null) {
         addLockedINodes(currentINode, currentINodeLock);
@@ -369,7 +368,7 @@ public class INodeLock extends BaseINodeLock {
         // ignore this lock. this is needed for sub operations in a sub tree ops protocol
         locked = false;
       }
-    } else {
+    }// else {
       // TODO: We need to double-check this. But for Serverless HopsFS, if ZooKeeper does not detect that the
       //       NameNode is alive, then we can safely assume that it is dead.
       //LOG.debug("The subtree is supposedly locked, but ZooKeeper has indicated that the owner of the lock is " +
@@ -385,7 +384,7 @@ public class INodeLock extends BaseINodeLock {
 //        LOG.debug("Ignoring subtree lock as more than " + timePassed + " ms has passed.  Max " +
 //                "lock retention time is:" + ServerlessNameNode.getFailedSTOCleanDelay());
 //      }
-    }
+    //}
 
     if (locked) {
       throw new RetriableException("The subtree " + iNode.getLocalName() + " is locked by " +
@@ -414,10 +413,11 @@ public class INodeLock extends BaseINodeLock {
     // TODO Handle the case that predecessor nodes get deleted before locking
     // lock upgrade if the path was not fully resolved
     if (resolvedINodes.size() != numPathComponents) {
+      if (LOG.isTraceEnabled()) LOG.trace("Path '" + path + "' was not fully resolved. Resolved " +
+              resolvedINodes.size() + "/" + numPathComponents + " path components. [v1]");
       // path was not fully resolved
       INode inodeToReread = null;
-      if (lockType ==
-              TransactionLockTypes.INodeLockType.WRITE_ON_TARGET_AND_PARENT) {
+      if (lockType == TransactionLockTypes.INodeLockType.WRITE_ON_TARGET_AND_PARENT) {
         if (resolvedINodes.size() <= numPathComponents - 2) {
           inodeToReread = resolvedINodes.get(resolvedINodes.size() - 1);
         }
@@ -428,18 +428,22 @@ public class INodeLock extends BaseINodeLock {
       if (inodeToReread != null) {
         long partitionIdOfINodeToBeReRead = INode.calculatePartitionId(inodeToReread.getParentId(), inodeToReread
                 .getLocalName(), inodeToReread.myDepth());
+        if (LOG.isTraceEnabled()) LOG.trace("Re-reading INode " + inodeToReread.getLocalName() + " (id=" + inodeToReread.getId() + ") with lock " + lockType.name() + ", partitionId=" + partitionIdOfINodeToBeReRead + ", parentId=" + inodeToReread.getParentId() + ".");
         INode inode = find(lockType, inodeToReread.getLocalName(),
                 inodeToReread.getParentId(), partitionIdOfINodeToBeReRead);
         if (inode != null) {
           // re-read after taking write lock to make sure that no one has created the same inode.
           addLockedINodes(inode, lockType);
           String existingPath = buildPath(path, resolvedINodes.size());
+          if (LOG.isTraceEnabled()) LOG.trace("Successfully re-read INode " + inode.getLocalName() + " (id=" + inode.getId() + "). Existing path = '" + existingPath + "'. Acquiring " + lockType.name() + " lock on rest of path '" + path + "'.");
           List<INode> rest =
                   acquireLockOnRestOfPath(lockType, inode, path, existingPath,
                           false);
           resolvedINodes.addAll(rest);
         }
       }
+    } else if (LOG.isTraceEnabled()) {
+      if (LOG.isTraceEnabled()) LOG.trace("Fully resolved '" + path + "'. Resolved " + resolvedINodes.size() + "/" + numPathComponents + " path components.");
     }
   }
 
@@ -450,6 +454,8 @@ public class INodeLock extends BaseINodeLock {
     // TODO Handle the case that predecessor nodes get deleted before locking
     // lock upgrade if the path was not fully resolved
     if (resolvedINodes.size() != components.length) {
+      if (LOG.isTraceEnabled()) LOG.trace("Path '" + path + "' was not fully resolved. Resolved " +
+              resolvedINodes.size() + "/" + components.length + " path components. [v2]");
       // path was not fully resolved
       INode inodeToReread = null;
       if (lockType ==
@@ -462,20 +468,21 @@ public class INodeLock extends BaseINodeLock {
       }
 
      if (inodeToReread != null) {
-        long partitionIdOfINodeToBeReRead = INode.calculatePartitionId(inodeToReread.getParentId(), inodeToReread
-        .getLocalName(), inodeToReread.myDepth());
+        long partitionIdOfINodeToBeReRead = INode.calculatePartitionId(inodeToReread.getParentId(), inodeToReread.getLocalName(), inodeToReread.myDepth());
+       if (LOG.isTraceEnabled()) LOG.trace("Re-reading INode " + inodeToReread.getLocalName() + " (id=" + inodeToReread.getId() + ") with lock " + lockType.name() + ", partitionId=" + partitionIdOfINodeToBeReRead + ", parentId=" + inodeToReread.getParentId() + ".");
         INode inode = find(lockType, inodeToReread.getLocalName(),
             inodeToReread.getParentId(), partitionIdOfINodeToBeReRead);
         if (inode != null) {
           // re-read after taking write lock to make sure that no one has created the same inode.
           addLockedINodes(inode, lockType);
           String existingPath = buildPath(path, resolvedINodes.size());
-          List<INode> rest =
-              acquireLockOnRestOfPath(lockType, inode, path, existingPath,
-                  false);
+          if (LOG.isTraceEnabled()) LOG.trace("Successfully re-read INode " + inode.getLocalName() + " (id=" + inode.getId() + "). Existing path = '" + existingPath + "'. Acquiring " + lockType.name() + " lock on rest of path '" + path + "'.");
+          List<INode> rest = acquireLockOnRestOfPath(lockType, inode, path, existingPath, false);
           resolvedINodes.addAll(rest);
         }
-      }
+      } else if (LOG.isTraceEnabled()) {
+       if (LOG.isTraceEnabled()) LOG.trace("Fully resolved '" + path + "'. Resolved " + resolvedINodes.size() + "/" + components.length + " path components.");
+     }
     }
   }
 

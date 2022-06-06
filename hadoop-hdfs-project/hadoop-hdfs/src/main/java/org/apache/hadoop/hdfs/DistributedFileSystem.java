@@ -74,8 +74,6 @@ import org.apache.hadoop.hdfs.security.token.block.InvalidBlockTokenException;
 import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier;
 import org.apache.hadoop.hdfs.server.namenode.ServerlessNameNode;
 import io.hops.metrics.OperationPerformed;
-import org.apache.hadoop.hdfs.serverless.invoking.ServerlessNameNodeClient;
-import org.apache.hadoop.hdfs.serverless.operation.ActiveServerlessNameNodeList;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.security.AccessControlException;
 import org.apache.hadoop.security.Credentials;
@@ -199,8 +197,8 @@ public class DistributedFileSystem extends FileSystem {
   }
 
   // Added for debugging serverless NN.
-  public void printDebugInformation() {
-    this.dfs.printDebugInformation();
+  public int printDebugInformation() {
+    return this.dfs.printDebugInformation();
   }
 
   public void setBenchmarkModeEnabled(boolean benchmarkModeEnabled) {
@@ -223,6 +221,7 @@ public class DistributedFileSystem extends FileSystem {
         DFSConfigKeys.DFS_USER_HOME_DIR_PREFIX_DEFAULT);
     
     this.dfs = new DFSClient(uri, conf, statistics);
+    this.dfs.initialize();
     this.uri = URI.create(uri.getScheme()+"://"+uri.getAuthority());
     this.workingDir = getHomeDirectory();
   }

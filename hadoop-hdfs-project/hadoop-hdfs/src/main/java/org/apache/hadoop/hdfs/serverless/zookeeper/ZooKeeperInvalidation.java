@@ -1,6 +1,6 @@
 package org.apache.hadoop.hdfs.serverless.zookeeper;
 
-import org.apache.hadoop.util.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 
 import java.io.Serializable;
 import java.util.List;
@@ -61,7 +61,7 @@ public class ZooKeeperInvalidation implements Serializable {
     public String toString() {
         return "ZooKeeperInvalidation(Leader NN ID=" + leaderNameNodeId + ", Operation ID=" + operationId +
                 ", Subtree INV = " + subtreeInvalidation + (subtreeInvalidation ? ", Subtree Root=" + subtreeRoot +
-                ")" : ", Invalidated INodes: " + StringUtils.join(", ", invalidatedINodes) + ")");
+                ")" : ", Invalidated INodes: " + StringUtils.join(invalidatedINodes, ", ") + ")");
     }
 
     public boolean isSubtreeInvalidation() {

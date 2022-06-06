@@ -1,14 +1,13 @@
-package org.apache.hadoop.hdfs.serverless.tcpserver;
-
-import org.apache.hadoop.hdfs.serverless.OpenWhiskHandler;
+package org.apache.hadoop.hdfs.serverless.userserver;
 
 import java.io.Serializable;
 import java.util.HashMap;
+import java.util.List;
 
 /**
  * Sent directly to NameNodes by clients rather than using the JSON representation.
  */
-public class TcpRequestPayload implements Serializable {
+public class TcpUdpRequestPayload implements Serializable {
     private static final long serialVersionUID = -7628398756895387675L;
 
     /**
@@ -46,14 +45,14 @@ public class TcpRequestPayload implements Serializable {
      *
      * This is transient because it is only used client-side and thus does not need to be serialized.
      */
-    private transient boolean cancelled = false;
+    // private transient boolean cancelled = false;
 
     /**
      * Used when cancelling this task. Indicates whether the task should be re-submitted to the NN.
      *
      * This is transient because it is only used client-side and thus does not need to be serialized.
      */
-    private transient boolean shouldRetry = false;
+    // private transient boolean shouldRetry = false;
 
     /**
      * Reason that this request has been cancelled. Only used if cancelled is set to true (i.e., when the
@@ -61,16 +60,29 @@ public class TcpRequestPayload implements Serializable {
      *
      * This is transient because it is only used client-side and thus does not need to be serialized.
      */
-    private transient String cancellationReason = null;
+    // private transient String cancellationReason = null;
 
-    public TcpRequestPayload(String requestId, String operationName, boolean consistencyProtocolEnabled,
-                             int serverlessFunctionLogLevel, HashMap<String, Object> fsOperationArguments,
-                             boolean benchmarkingModeEnabled) {
+    /**
+     * All the actively-used TCP ports on our VM. The NN uses these to connect to the other servers.
+     */
+    private List<Integer> activeTcpPorts;
+
+    /**
+     * All the actively-used TCP ports on our VM. The NN uses these to connect to the other servers.
+     */
+    private List<Integer> activeUdpPorts;
+
+    public TcpUdpRequestPayload(String requestId, String operationName, boolean consistencyProtocolEnabled,
+                                int serverlessFunctionLogLevel, HashMap<String, Object> fsOperationArguments,
+                                boolean benchmarkingModeEnabled, List<Integer> activeTcpPorts,
+                                List<Integer> activeUdpPorts) {
         this.requestId = requestId;
         this.operationName = operationName;
         this.consistencyProtocolEnabled = consistencyProtocolEnabled;
         this.serverlessFunctionLogLevel = serverlessFunctionLogLevel;
         this.benchmarkingModeEnabled = benchmarkingModeEnabled;
+        this.activeTcpPorts = activeTcpPorts;
+        this.activeUdpPorts = activeUdpPorts;
 
         if (fsOperationArguments != null)
             this.fsOperationArguments = fsOperationArguments;
@@ -78,7 +90,7 @@ public class TcpRequestPayload implements Serializable {
             this.fsOperationArguments = new HashMap<>();
     }
 
-    private TcpRequestPayload() { }
+    private TcpUdpRequestPayload() { }
 
     public HashMap<String, Object> getFsOperationArguments() { return this.fsOperationArguments; }
 
@@ -100,26 +112,30 @@ public class TcpRequestPayload implements Serializable {
 
     public boolean isBenchmarkingModeEnabled() { return benchmarkingModeEnabled; }
 
-    public boolean isCancelled() { return cancelled; }
+    // public boolean isCancelled() { return cancelled; }
 
-    public boolean shouldRetry() { return shouldRetry; }
+    // public boolean shouldRetry() { return shouldRetry; }
 
-    public String getCancellationReason() { return cancellationReason; }
+    public List<Integer> getActiveTcpPorts() { return this.activeTcpPorts; }
+
+    public List<Integer> getActiveUdpPorts() { return this.activeUdpPorts; }
+
+    // public String getCancellationReason() { return cancellationReason; }
 
     /**
      * Used to mark this request as cancelled. Used when the TCP connection via which this payload was submitted
      * is disconnected before a result is received.
      */
-    public void setCancelled(boolean cancelled) { this.cancelled = cancelled; }
+    // public void setCancelled(boolean cancelled) { this.cancelled = cancelled; }
 
-    public void setShouldRetry(boolean shouldRetry) { this.shouldRetry = shouldRetry; }
+    // public void setShouldRetry(boolean shouldRetry) { this.shouldRetry = shouldRetry; }
 
-    public void setCancellationReason(String cancellationReason) { this.cancellationReason = cancellationReason; }
+    // public void setCancellationReason(String cancellationReason) { this.cancellationReason = cancellationReason; }
 
     @Override
     public String toString() {
         return String.format(
-                "TcpRequestPayload(requestId=%s, operationName=%s, consistProtoEnabled=%b, logLevel=%s, numFsArgs=%d",
+                "TcpRequestPayload(requestId=%s, operationName=%s, consistProtoEnabled=%b, logLevel=%s, numFsArgs=%d)",
                 requestId, operationName, consistencyProtocolEnabled, serverlessFunctionLogLevel, fsOperationArguments.size());
     }
 }

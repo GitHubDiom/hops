@@ -88,6 +88,22 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
   public static final boolean SERVERLESS_STRAGGLER_MITIGATION_DEFAULT = false;
 
   /**
+   * When enabled, clients using a newly-created TCP server can piggy-back off of existing connections of other
+   * TCP servers running within the same VM. This prevents too many HTTP requests from being issued all-at-once.
+   */
+  public static final String SERVERLESS_CONNECTION_SHARING = "serverless.tcp.connection-sharing-enabled";
+  public static final boolean SERVERLESS_CONNECTION_SHARING_DEFAULT = true;
+
+  /**
+   * The likelihood that connection sharing occurs when one's own TCP server does not have an active connection
+   * to a NameNode in the target deployment. The alternative to connection sharing is to simply fall back to HTTP.
+   *
+   * This is the probability that it DOES occur.
+   */
+  public static final String SERVERLESS_CONNECTION_SHARING_CHANCE = "serverless.tcp.connection-sharing-chance";
+  public static final double SERVERLESS_CONNECTION_SHARING_CHANCE_DEFAULT = 0.85;
+
+  /**
    * Minimum timeout when using straggler mitigation.
    */
   public static final String SERVERLESS_STRAGGLER_MITIGATION_MIN_TIMEOUT = "serverless.straggler.mitigation.timeout.min";
@@ -152,6 +168,50 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
   public static final int SERVERLESS_TCP_SERVER_PORT_DEFAULT = 6000;
 
   /**
+   * The number of clients thread that will use the same TCP server to send and receive requests.
+   *
+   * A value <= 0 will make it so all clients on the same VM use the same TCP server.
+   */
+  public static final String SERVERLESS_CLIENTS_PER_TCP_SERVER = "serverless.tcp.clients-per-server";
+  public static final int SERVERLESS_CLIENTS_PER_TCP_SERVER_DEFAULT = -1;
+
+  /**
+   * There are certain times when clients will use the TCP server NOT assigned to them. In this case,
+   * they query a manager that iterates over all servers to find an appropriate candidate. We periodically
+   * shuffle the list of all servers to avoid disproportionately using servers at the beginning of this list.
+   *
+   * A value <= 0 will result in the list NEVER being shuffled.
+   */
+  public static final String SERVERLESS_SHUFFLE_SERVERS_EVERY = "serverless.tcp.shuffle-servers-every";
+  public static final int SERVERLESS_SHUFFLE_SERVERS_EVERY_DEFAULT = 100;
+
+  /**
+   * The maximum size we should allocate for the TCP buffers,
+   * regardless of the number of clients per TCP server.
+   */
+  public static final String SERVERLESS_TCP_MAX_BUFFER_SIZE = "serverless.tcp.max-buffer-size";
+  public static final int SERVERLESS_TCP_MAX_BUFFER_SIZE_DEFAULT = (int)1e9;
+
+  /**
+   * We batch individual requests together to reduce per-request overhead.
+   * This is the number of requests per batch.
+   */
+  public static final String SERVERLESS_HTTP_BATCH_SIZE = "serverless.http.batch-size";
+  public static final int SERVERLESS_HTTP_BATCH_SIZE_DEFAULT = 4;
+
+  /**
+   * The interval, in milliseconds, that HTTP requests are issued.
+   */
+  public static final String SERVERLESS_HTTP_SEND_INTERVAL = "serverless.http.send-interval";
+  public static final int SERVERLESS_HTTP_SEND_INTERVAL_DEFAULT = 5;
+
+  /**
+   * The number of bytes allocated per client for the TCP server's buffers.
+   */
+  public static final String SERVERLESS_TCP_BASE_BUFFER_SIZE = "serverless.tcp.base-buffer-size";
+  public static final int SERVERLESS_TCP_BASE_BUFFER_SIZE_DEFAULT = (int)2.5e5;
+
+  /**
    * Port to use for UDP server.
    */
   public static final String SERVERLESS_UDP_SERVER_PORT = "serverless.udp.port";
@@ -172,6 +232,12 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
   public static final String SERVERLESS_HTTP_RETRY_MAX = "serverless.http.maxretries";
   public static final int SERVERLESS_HTTP_RETRY_MAX_DEFAULT = 3;
 
+  /**
+   * Maximum number of attempts to issue a TCP/UDP request before falling back to HTTP.
+   */
+  public static final String SERVERLESS_TCP_RETRY_MAX = "serverless.tcp.max-retries";
+  public static final int SERVERLESS_TCP_RETRY_MAX_DEFAULT = 5;
+
   public static final String SERVERLESS_TCP_DEBUG_LOGGING = "serverless.tcp.debuglogenabled";
   public static final boolean SERVERLESS_TCP_DEBUG_LOGGING_DEFAULT = false;
 
@@ -185,6 +251,9 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
 
   public static final String SERVERLESS_METADATA_CACHE_ENABLED = "serverless.metadatacache.enabled";
   public static final boolean SERVERLESS_METADATA_CACHE_ENABLED_DEFAULT = true;
+
+  public static final String SERVERLESS_METADATA_CACHE_CAPACITY = "serverless.metadatacache.capacity";
+  public static final int SERVERLESS_METADATA_CACHE_CAPACITY_DEFAULT = 825_000; // Each INode is around 1,168 bytes.
 
   /**
    * How often, in seconds, the list of active name nodes should be updated.
