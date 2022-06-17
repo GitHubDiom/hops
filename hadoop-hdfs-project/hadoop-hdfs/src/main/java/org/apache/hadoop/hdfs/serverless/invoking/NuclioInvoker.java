@@ -41,7 +41,7 @@ public class NuclioInvoker extends ServerlessInvokerBase {
     }
 
     @Override
-    protected void sendOutgoingRequests() {
+    protected void sendEnqueuedRequests() {
         throw new NotImplementedException("This feature is not supported for Nuclio invokers.");
     }
 
@@ -118,13 +118,5 @@ public class NuclioInvoker extends ServerlessInvokerBase {
     @Override
     public CloseableHttpAsyncClient getHttpClient() throws NoSuchAlgorithmException, KeyManagementException, CertificateException, KeyStoreException, IOReactorException {
         return getGenericTrustAllHttpClient();
-    }
-
-    @Override
-    public ServerlessHttpFuture redirectRequest(String operationName, JsonObject nameNodeArguments,
-                                                JsonObject fileSystemOperationArguments, String requestId,
-                                                int targetDeployment)
-            throws IOException {
-        return enqueueHttpRequestInt(operationName, nameNodeArguments, fileSystemOperationArguments, requestId, targetDeployment);
     }
 }

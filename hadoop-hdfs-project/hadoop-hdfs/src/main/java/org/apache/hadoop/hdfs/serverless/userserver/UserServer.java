@@ -268,7 +268,7 @@ public class UserServer {
     /**
      * Stop the TCP server.
      */
-    public void stop() {
+    public void terminate() {
         LOG.debug("HopsFSUserServer " + tcpPort + " stopping now...");
         this.server.removeListener(serverListener);
         LOG.debug("HopsFSUserServer " + tcpPort + " removed listener.");
@@ -288,7 +288,7 @@ public class UserServer {
     public synchronized int startServer() throws IOException {
         if (!enabled) {
             LOG.warn("TCP Server is NOT enabled. Server will NOT be started.");
-            return -1;
+            return tcpPort;
         }
 
         if (started) {
@@ -354,8 +354,8 @@ public class UserServer {
         if (!success)
             throw new IOException("Failed to start TCP/UDP server. Could not successfully bind to any ports.");
 
-        client.setTcpServerPort(tcpPort);
-        client.setUdpServerPort(udpPort);
+        //client.setTcpServerPort(tcpPort);
+        //client.setUdpServerPort(udpPort);
 
         this.started = true;
 
@@ -475,7 +475,7 @@ public class UserServer {
      */
     public int getTcpPort() {
         if (!started)
-            throw new IllegalStateException("User server has not been started yet. TCP port has not been assigned.");
+            LOG.warn("User server has not been started yet. TCP port may not have been assigned.");
 
         return this.tcpPort;
     }

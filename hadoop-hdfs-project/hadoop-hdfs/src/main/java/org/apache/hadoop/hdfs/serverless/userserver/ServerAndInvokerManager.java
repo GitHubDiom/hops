@@ -1,8 +1,12 @@
 package org.apache.hadoop.hdfs.serverless.userserver;
 
+import io.hops.transaction.context.TransactionsStats;
 import org.apache.commons.logging.LogFactory;
+import org.apache.commons.math3.util.Pair;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
+import org.apache.hadoop.hdfs.serverless.invoking.ServerlessInvokerBase;
+import org.apache.hadoop.hdfs.serverless.invoking.ServerlessInvokerFactory;
 import org.apache.hadoop.hdfs.serverless.invoking.ServerlessNameNodeClient;
 
 import java.io.IOException;
@@ -13,20 +17,25 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import static org.apache.hadoop.hdfs.DFSConfigKeys.*;
 
-public class UserServerManager {
-    private static final org.apache.commons.logging.Log LOG = LogFactory.getLog(UserServerManager.class);
+public class ServerAndInvokerManager {
+    private static final org.apache.commons.logging.Log LOG = LogFactory.getLog(ServerAndInvokerManager.class);
 
     /**
      * Maximum number of clients allowed to use a single TCP server.
      */
     private volatile int maxClientsPerServer;
 
-    private static UserServerManager instance;
+    private static ServerAndInvokerManager instance;
 
     /**
      * Map from server TCP port to the associated {@link UserServer} instance.
      */
     private final HashMap<Integer, UserServer> tcpPortToServerMapping;
+
+    /**
+     * Mapping from TCP port to {@link ServerlessInvokerBase} instance.
+     */
+    private final HashMap<Integer, ServerlessInvokerBase> tcpPortToInvokerMapping;
 
     /**
      * Map from server TCP port to the number of clients it has assigned to it.
@@ -66,13 +75,27 @@ public class UserServerManager {
      */
     private volatile int nextUdpPort;
 
+    /**
+     * Name of the serverless platform we're using.
+     */
+    private String serverlessPlatformName;
+
     private final ReadWriteLock mutex = new ReentrantReadWriteLock();
 
     private final ArrayList<UserServer> userServers = new ArrayList<>();
 
+    private final ArrayList<ServerlessInvokerBase> invokers = new ArrayList<>();
+
     /**
-     * Gets incremented every time somebody calls {@link UserServerManager#findServerWithActiveConnectionToDeployment(int)}
-     * or {@link UserServerManager#findServerWithAtLeastOneActiveConnection()}. We use this to determine when to shuffle
+     * Indicates whether the {@link ServerAndInvokerManager#terminate()} function has been called.
+     *
+     * TODO: Should we check if `stopped` is true before doing work in most functions?
+     */
+    private volatile boolean stopped = false;
+
+    /**
+     * Gets incremented every time somebody calls {@link ServerAndInvokerManager#findServerWithActiveConnectionToDeployment(int)}
+     * or {@link ServerAndInvokerManager#findServerWithAtLeastOneActiveConnection()}. We use this to determine when to shuffle
      * the list of user servers to ensure servers at the beginning of the list aren't disproportionately used.
      */
     private AtomicInteger counter = new AtomicInteger(0);
@@ -87,16 +110,16 @@ public class UserServerManager {
     /**
      * Retrieve the singleton instance, or create it if it does not exist.
      *
-     * IMPORTANT: You must call {@link UserServerManager#setConfiguration(Configuration)} on the instance
+     * IMPORTANT: You must call {@link ServerAndInvokerManager#setConfiguration(Configuration)} on the instance
      * returned by this function. If the singleton instance is being created for the first time, then it
-     * will not be configured properly unless the {@link UserServerManager#setConfiguration(Configuration)}
+     * will not be configured properly unless the {@link ServerAndInvokerManager#setConfiguration(Configuration)}
      * is called on it.
      *
-     * @return the singleton {@link UserServerManager} instance.
+     * @return the singleton {@link ServerAndInvokerManager} instance.
      */
-    public synchronized static UserServerManager getInstance() {
+    public synchronized static ServerAndInvokerManager getInstance() {
         if (instance == null)
-            instance = new UserServerManager();
+            instance = new ServerAndInvokerManager();
 
         return instance;
     }
@@ -120,6 +143,8 @@ public class UserServerManager {
         this.nextUdpPort = configuration.getInt(DFSConfigKeys.SERVERLESS_UDP_SERVER_PORT,
                 DFSConfigKeys.SERVERLESS_UDP_SERVER_PORT_DEFAULT);
 
+        this.serverlessPlatformName = configuration.get(SERVERLESS_PLATFORM, SERVERLESS_PLATFORM_DEFAULT);
+
         // If the user has specified a value <= 0, then all clients on the same VM will share the same server.
         if (this.maxClientsPerServer <= 0) {
             this.maxClientsPerServer = Integer.MAX_VALUE;
@@ -129,8 +154,9 @@ public class UserServerManager {
         this.configured = true;
     }
 
-    private UserServerManager() {
+    private ServerAndInvokerManager() {
         tcpPortToServerMapping = new HashMap<>();
+        tcpPortToInvokerMapping = new HashMap<>();
         serverClientCounts = new HashMap<>();
         activeTcpPorts = new HashSet<>();
         activeUdpPorts = new HashSet<>();
@@ -161,7 +187,7 @@ public class UserServerManager {
     }
 
     /**
-     * Check if we should shuffle the {@link UserServerManager#userServers} variable. If so, then shuffle it.
+     * Check if we should shuffle the {@link ServerAndInvokerManager#userServers} variable. If so, then shuffle it.
      */
     private void checkIfShuffleRequired() {
         int val = counter.incrementAndGet();
@@ -282,6 +308,21 @@ public class UserServerManager {
     }
 
     /**
+     * Terminate all the {@link UserServer} and {@link ServerlessInvokerBase} instances.
+     */
+    public synchronized void terminate() {
+        if (!stopped) {
+            stopped = true;
+
+            for (UserServer userServer : userServers)
+                userServer.terminate();
+
+            for (ServerlessInvokerBase invoker : invokers)
+                invoker.terminate();
+        }
+    }
+
+    /**
      * Register a client with a TCP server. All that actually happens here is that
      * the client gets the TCP server that it will use for communicating with NameNodes.
      *
@@ -290,15 +331,21 @@ public class UserServerManager {
      *
      * @param client The client registering with us. The {@link ServerlessNameNodeClient} should call this
      *               function and pass "this" for the {@code client} parameter.
+     * @param clientName Passed to new invokers.
+     * @param serverlessEndpointBase Passed to new invokers.
      *
      * @return The TCP server that this particular client should use.
      */
     // synchronized so multiple calls to this function cannot overlap.
     // we also use locking so that the `findServerWithActiveConnectionToDeployment()` can execute concurrently,
     // although this probably shouldn't happen due to when these synchronized functions are called in a workload.
-    public synchronized UserServer registerWithTcpServer(ServerlessNameNodeClient client)
-            throws IOException {
+    public synchronized Pair<UserServer, ServerlessInvokerBase> registerClient(
+            ServerlessNameNodeClient client, String clientName, String serverlessEndpointBase) throws IOException {
+        if (stopped)
+            throw new IllegalStateException("Manager has been stopped. Cannot register new clients.");
+
         UserServer assignedServer;
+        ServerlessInvokerBase assignedInvoker;
         int oldNumClients = -1;
         int assignedPort = -1;
 
@@ -310,8 +357,8 @@ public class UserServerManager {
                 int numClients = entry.getValue();
 
                 if (numClients < maxClientsPerServer) {
-                    LOG.info("Assigning client to TCP Server " + tcpPort + ", which will now have " +
-                            (numClients + 1) + " clients assigned to it.");
+                    LOG.info("Assigning client " + clientName + " to TCP Server " + tcpPort +
+                            ", which will now have " + (numClients + 1) + " clients assigned to it.");
 
                     oldNumClients = numClients;
                     assignedPort = tcpPort;
@@ -321,38 +368,81 @@ public class UserServerManager {
 
             if (oldNumClients == -1 && assignedPort == -1) {
                 // Create new TCP server.
-                LOG.info("Creating new user server. Attempting to use TCP port " + nextTcpPort + ", UDP port " +
-                        nextUdpPort);
+                LOG.info("Creating new user server for client " + clientName + ". Attempting to use TCP port " +
+                        nextTcpPort + ", UDP port " + nextUdpPort);
                 assignedServer = new UserServer(conf, client, nextTcpPort, nextUdpPort);
+                assignedInvoker = ServerlessInvokerFactory.getServerlessInvoker(serverlessPlatformName);
+                assignedInvoker.setIsClientInvoker(true);
+                assignedInvoker.setConfiguration(conf, "C-" + clientName, serverlessEndpointBase);
                 int tcpPort = assignedServer.startServer();
+                assert(tcpPort == assignedPort);
 
                 activeTcpPorts.add(tcpPort);
-                activeUdpPorts.add(assignedServer.getUdpPort());
+
+                if (assignedServer.isUdpEnabled() && client.isTcpEnabled())
+                    activeUdpPorts.add(assignedServer.getUdpPort());
+
+                // We now set the ports here.
+                assignedInvoker.setTcpPort(assignedPort);
+
+                if (assignedServer.isUdpEnabled() && client.isTcpEnabled())
+                    assignedInvoker.setUdpPort(assignedServer.getUdpPort());
+
+                assignedInvoker.setServerlessFunctionLogLevel(client.getServerlessFunctionLogLevel());
+                assignedInvoker.setConsistencyProtocolEnabled(client.getConsistencyProtocolEnabled());
+                assignedInvoker.setBenchmarkModeEnabled(client.getBenchmarkModeEnabled());
 
                 serverClientCounts.put(tcpPort, 1);
                 tcpPortToServerMapping.put(tcpPort, assignedServer);
+                tcpPortToInvokerMapping.put(tcpPort, assignedInvoker);
                 nextTcpPort++;
                 nextUdpPort++;
 
-                LOG.info("Created new TCP server with TCP port " + tcpPort + ". There are now " +
-                        tcpPortToServerMapping.size() + " unique TCP server(s).");
+                LOG.info("Created new TCP server with TCP port " + tcpPort + " for client " + clientName +
+                        ". There are now " + tcpPortToServerMapping.size() + " unique TCP server(s).");
 
                 userServers.add(assignedServer);
+                invokers.add(assignedInvoker);
             } else {
-                LOG.info("Retrieving existing TCP server with TCP port " + assignedPort + ".");
+                LOG.info("Retrieving existing TCP server with TCP port " + assignedPort + " for client " +
+                        clientName + ".");
                 // Grab existing server and return it.
                 assignedServer = tcpPortToServerMapping.get(assignedPort);
+                assignedInvoker = tcpPortToInvokerMapping.get(assignedPort);
                 serverClientCounts.put(assignedPort, oldNumClients + 1);
+
+                // COMMENTED OUT: The TCP/UDP port will be assigned when the invoker is first created.
+                // Don't need to do it again each time we assign a new client to the invoker.
 
                 // Make sure to set the client's TCP/UDP port values, since this step
                 // doesn't happen automatically when we're using an existing server.
-                client.setTcpServerPort(assignedServer.getTcpPort());
-                client.setUdpServerPort(assignedServer.getUdpPort());
+                // client.setTcpServerPort(assignedServer.getTcpPort());
+                // client.setUdpServerPort(assignedServer.getUdpPort());
             }
         } finally {
             mutex.writeLock().unlock();
         }
 
-        return assignedServer;
+        assert(assignedServer != null);
+        assert(assignedInvoker != null);
+        return new Pair<>(assignedServer, assignedInvoker);
     }
+
+//    public void clearStatisticsPackages() {
+//        for (ServerlessInvokerBase invokerBase : invokers) {
+//            invokerBase.getStatisticsPackages().clear();
+//        }
+//    }
+//
+//    public void clearTransactionStatistics() {
+//        for (ServerlessInvokerBase invokerBase : invokers) {
+//            invokerBase.getTransactionEvents().clear();
+//        }
+//    }
+//    public void mergeStatisticsPackages(HashMap<String, TransactionsStats.ServerlessStatisticsPackage> packages,
+//                                        boolean keepLocal) {
+//        for (ServerlessInvokerBase invokerBase : invokers) {
+//            invokerBase.getTransactionEvents().clear();
+//        }
+//    }
 }

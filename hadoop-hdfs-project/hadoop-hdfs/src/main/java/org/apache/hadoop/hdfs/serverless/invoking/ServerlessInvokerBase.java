@@ -13,7 +13,7 @@ import org.apache.hadoop.hdfs.serverless.OpenWhiskHandler;
 import org.apache.hadoop.hdfs.serverless.ServerlessNameNodeKeys;
 import org.apache.hadoop.hdfs.serverless.cache.FunctionMetadataMap;
 import org.apache.hadoop.hdfs.serverless.execution.results.NullResult;
-import org.apache.hadoop.hdfs.serverless.userserver.UserServerManager;
+import org.apache.hadoop.hdfs.serverless.userserver.ServerAndInvokerManager;
 import org.apache.hadoop.hdfs.serverless.execution.futures.ServerlessHttpFuture;
 import org.apache.hadoop.util.ExponentialBackOff;
 import org.apache.hadoop.util.StringUtils;
@@ -47,9 +47,7 @@ import java.security.*;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.*;
 
 import static org.apache.hadoop.hdfs.DFSConfigKeys.*;
 import static org.apache.hadoop.hdfs.serverless.ServerlessNameNodeKeys.*;
@@ -88,27 +86,36 @@ import static org.apache.hadoop.hdfs.serverless.invoking.ServerlessUtilities.ext
  * serverless platform component is. We issue a request to whatever we're supposed to in order to invoke functions. In
  * the case of OpenWhisk, that's the API Gateway component.)
  *
- * TODO: Multiple clients on the same VM should share {@link ServerlessInvokerBase} instances, just as multiple
- *       clients on the same VM can share {@link org.apache.hadoop.hdfs.serverless.userserver.UserServer} instances.
+ * TODO: Put metrics all on ServerlessNameNodeClient.
  */
 public abstract class ServerlessInvokerBase {
     private static final Log LOG = LogFactory.getLog(ServerlessInvokerBase.class);
 
     protected Registry<ConnectionSocketFactory> registry;
 
+    private static final Random rng = new Random();
+
+    /**
+     * The set of request IDs that have been processed from the request queue and are ready to be sent.
+     * If an error occurs during processing, then these already-processed requests can be cancelled rather
+     * than having the request fail silently.
+     */
+    protected static ThreadLocal<Set<String>> processedRequestIds = new ThreadLocal<>();
+
     /**
      * Store the statistics packages from serverless name nodes in this HashMap.
      *
      * Map from request ID to statistics packages.
      */
-    protected HashMap<String, TransactionsStats.ServerlessStatisticsPackage> statisticsPackages;
+    private static ConcurrentHashMap<String, TransactionsStats.ServerlessStatisticsPackage> statisticsPackages
+            = new ConcurrentHashMap<>();
 
     /**
      * Store the transaction events from serverless name nodes in this HashMap.
      *
      * Map from request ID to statistics packages.
      */
-    protected HashMap<String, List<TransactionEvent>> transactionEvents;
+    private static ConcurrentHashMap<String, List<TransactionEvent>> transactionEvents = new ConcurrentHashMap<>();
 
     /**
      * Flag indicating whether we are running in 'local mode', which is only relevant on the client-side.
@@ -194,9 +201,9 @@ public abstract class ServerlessInvokerBase {
      * The TCP port that we ultimately bound to. See the comment in 'ServerlessNameNodeClient' for its
      * 'tcpServerPort' instance field for explanation as to why this field exists.
      */
-    protected int tcpPort;
+    protected volatile int tcpPort;
 
-    protected int udpPort;
+    protected volatile int udpPort;
 
     /**
      * The timeout, in milliseconds, for an HTTP request to a NameNode. This specifically
@@ -213,14 +220,12 @@ public abstract class ServerlessInvokerBase {
     /**
      * Passed to serverless functions. Determines whether they execute the consistency protocol.
      */
-    protected boolean consistencyProtocolEnabled = true;
+    protected volatile boolean consistencyProtocolEnabled = true;
 
     /**
      * Turns off metric collection to save time, network transfer, and memory.
      */
-    protected boolean benchmarkModeEnabled = false;
-
-    private static ServerlessInvokerBase instance;
+    protected volatile boolean benchmarkModeEnabled = false;
 
     /**
      * Outgoing requests are placed in this list and sent in batches
@@ -242,12 +247,14 @@ public abstract class ServerlessInvokerBase {
     protected String functionUriBase;
 
     /**
+     * This is used to issue all queued requests on an interval.
+     */
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+
+    /**
      * Default constructor.
      */
     protected ServerlessInvokerBase() {
-        // instantiateTrustManager();
-        statisticsPackages = new HashMap<>();
-        transactionEvents = new HashMap<>();
         this.futures = new ConcurrentHashMap<>();
     }
 
@@ -256,26 +263,43 @@ public abstract class ServerlessInvokerBase {
      * This function should call the {@link ServerlessInvokerBase#addStandardArguments(JsonObject)} function. This is
      * done to ensure that the NameNode has all of the required information necessary to properly handle the request.
      *
-     * This function should also call {@link ServerlessInvokerBase#createRequestBatches()} and use the
+     * This function should also call {@link ServerlessInvokerBase#createRequestBatches(List)} and use the
      * returned {@code List<List<JsonArray>>} object to send the requests.
      */
-    protected abstract void sendOutgoingRequests() throws UnsupportedEncodingException, SocketException, UnknownHostException;
+    protected abstract void sendEnqueuedRequests()
+            throws UnsupportedEncodingException, SocketException, UnknownHostException;
+
+    public void setBenchmarkModeEnabled(boolean benchmarkModeEnabled) {
+        this.benchmarkModeEnabled = benchmarkModeEnabled;
+    }
 
     /**
      * Merges the requests from each deployment into batches (of a configurable maximum size).
      * The batched requests are returned. These batches will then be issued in requests to the respective deployment.
-     * The invocations should occur in the {@link ServerlessInvokerBase#sendOutgoingRequests()} function, which is
+     * The invocations should occur in the {@link ServerlessInvokerBase#sendEnqueuedRequests()} function, which is
      * abstract and thus will be implemented by a subclass of {@link ServerlessInvokerBase}.
      *
      * Each batch of requests will be processed by a single NameNode. The results of the entire batch will be
      * returned all at once, rather than one-at-a-time.
      *
-     * @return Batches of requests by deployment. Entry i in the returned list corresponds to deployment i.
+     * @param batchedRequests Empty list that will be populated with batches of requests.
+     * @return The number of requests that we placed into batches.
+     *
      * Each {@link JsonObject} contains a batch of requests.
      */
-    protected List<List<JsonObject>> createRequestBatches() {
-        List<List<JsonObject>> batchedRequests = new ArrayList<>();
+    protected int createRequestBatches(List<List<JsonObject>> batchedRequests) {
+        // Old return documentation:
+        // @return Batches of requests by deployment. Entry i in the returned list corresponds to deployment i.
+        if (batchedRequests.size() > 0)
+            throw new IllegalArgumentException("The batchedRequests list must be initially empty.");
 
+        Set<String> _processedRequestIds = processedRequestIds.get();
+
+        // Iterate over the request queue for each of the deployments.
+        // For each queue, we check if it has at least one enqueued request.
+        // If there are none, then we skip that queue.
+        // If it has at least one request, then we partition however many requests there are into batches.
+        int totalNumRequests = 0;
         for (int i = 0; i < numDeployments; i++) {
             LinkedBlockingQueue<JsonObject> deploymentQueue = outgoingRequests[i];
 
@@ -283,12 +307,16 @@ public abstract class ServerlessInvokerBase {
             List<JsonObject> deploymentBatches = new ArrayList<>();
             batchedRequests.add(deploymentBatches);
 
+            // Does this queue have at least one request?
             if (deploymentQueue.size() > 0) {
+                if (LOG.isDebugEnabled()) LOG.debug("Deployment " + i + " has " + deploymentQueue.size() + " requests enqueued...");
+
                 JsonObject currentBatch = new JsonObject();
                 deploymentBatches.add(currentBatch);
 
-                int j = 0;
-                while (j < deploymentQueue.size()) {
+                // Process all requests in the queue. Note that other requests could be added while processing.
+                // These requests will presumably end up being processed now, rather than the next time we do this.
+                while (deploymentQueue.size() > 0) {
                     JsonObject request = deploymentQueue.poll();
 
                     if (request == null) {
@@ -302,8 +330,9 @@ public abstract class ServerlessInvokerBase {
                     }
 
                     String requestId = request.get(REQUEST_ID).getAsString();
+
                     currentBatch.add(requestId, request);
-                    j++;
+                    totalNumRequests++;
 
                     // If the current batch's size is equal to that of the batch size parameter,
                     // then we need to start a new batch.
@@ -317,23 +346,15 @@ public abstract class ServerlessInvokerBase {
                             deploymentBatches.add(currentBatch);
                         }
                     }
+
+                    // The request has been fully processed and is ready to be sent, so add it to the set.
+                    _processedRequestIds.add(requestId);
                 }
             }
         }
 
-        return batchedRequests;
-    }
-
-    /**
-     * Return the INode-NN mapping cache entry for the given file or directory.
-     *
-     * This function returns -1 if no such entry exists.
-     * @param fileOrDirectory The file or directory in question.
-     * @return The number of the NN to which the file or directory is mapped, if an entry exists in the cache. If no
-     * entry exists, then -1 is returned.
-     */
-    public int getFunctionNumberForFileOrDirectory(String fileOrDirectory) {
-        return consistentHash(Hashing.md5().hashString(extractParentPath(fileOrDirectory)), numDeployments);
+        if (LOG.isTraceEnabled() && totalNumRequests > 0) LOG.trace("Partitioned a total of " + totalNumRequests + " request(s) into batches.");
+        return totalNumRequests;
     }
 
     /**
@@ -411,7 +432,7 @@ public abstract class ServerlessInvokerBase {
      * Update the TCP port being used by this client's TCP server.
      * @param tcpPort The new value for the TCP port.
      */
-    public void setTcpPort(int tcpPort) {
+    public synchronized void setTcpPort(int tcpPort) {
         this.tcpPort = tcpPort;
     }
 
@@ -419,7 +440,7 @@ public abstract class ServerlessInvokerBase {
      * Update the UDP port being used by this client's UDP server.
      * @param udpPort The new value for the UDP port.
      */
-    public void setUdpPort(int udpPort) {
+    public synchronized void setUdpPort(int udpPort) {
         this.udpPort = udpPort;
     }
 
@@ -442,7 +463,7 @@ public abstract class ServerlessInvokerBase {
                 DFSConfigKeys.SERVERLESS_HTTP_TIMEOUT_DEFAULT) * 1000; // Convert from seconds to milliseconds.
         batchSize = conf.getInt(SERVERLESS_HTTP_BATCH_SIZE, SERVERLESS_HTTP_BATCH_SIZE_DEFAULT);
         sendInterval = conf.getInt(SERVERLESS_HTTP_SEND_INTERVAL, SERVERLESS_HTTP_SEND_INTERVAL_DEFAULT);
-        functionUriBase = functionUriBase;
+        this.functionUriBase = functionUriBase;
 
         if (this.localMode)
             numDeployments = 1;
@@ -458,6 +479,8 @@ public abstract class ServerlessInvokerBase {
             LOG.debug("NDB debug enabled: " + debugEnabledNdb);
             LOG.debug("TCP Enabled: " + tcpEnabled);
             LOG.debug("UDP Enabled: " + udpEnabled);
+            LOG.debug("Batch size: " + batchSize);
+            LOG.debug("Send interval: " + sendInterval);
 
             if (debugEnabledNdb) LOG.debug("NDB debug string: " + debugStringNdb);
         }
@@ -469,14 +492,69 @@ public abstract class ServerlessInvokerBase {
             return;
         }
 
+        if (LOG.isDebugEnabled()) LOG.debug("Starting async HTTP client now...");
+        httpClient.start();
+        if (LOG.isDebugEnabled()) LOG.debug("Started async HTTP client.");
+
         outgoingRequests = new LinkedBlockingQueue[numDeployments];
 
         // Create an outgoing request queue for each deployment.
         for (int i = 0; i < numDeployments; i++) {
-            outgoingRequests[i] = new LinkedBlockingQueue<JsonObject>();
+            outgoingRequests[i] = new LinkedBlockingQueue<>();
         }
 
         configured = true;
+
+        // Schedule the processing and sending of enqueued HTTP requests on a schedule with fixed delay.
+        // This means that the scheduled operation will execute `sendInterval` milliseconds after the previous
+        // execution completes. This will occur indefinitely.
+        scheduler.scheduleWithFixedDelay(
+                this::scheduledRequestProcessor, sendInterval, sendInterval, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * This method is executed by a {@link ScheduledExecutorService} instance every
+     * {@link ServerlessInvokerBase#sendInterval} milliseconds.
+     */
+    private void scheduledRequestProcessor() {
+        // Each time we process the enqueued requests, we clear this set.
+        Set<String> _processedRequestIds = processedRequestIds.get();
+        if (_processedRequestIds == null) {
+            _processedRequestIds = new HashSet<>();
+            processedRequestIds.set(_processedRequestIds);
+        } else {
+            _processedRequestIds.clear();
+        }
+
+        try {
+            sendEnqueuedRequests();
+        } catch (Exception e) {
+            LOG.error("Exception encountered while issuing HTTP requests:", e);
+            handleAlreadyProcessedRequestsOnException(_processedRequestIds);
+        }
+    }
+
+    /**
+     * If an exception occurs while preparing enqueued HTTP requests to be transmitted,
+     * then the already-processed HTTP requests need to be cancelled.
+     */
+    private void handleAlreadyProcessedRequestsOnException(Set<String> _processedRequestIds) {
+        LOG.warn("The following requests have already been processed and must now be cancelled: " +
+                StringUtils.join(", ", _processedRequestIds));
+
+        int totalNumFuturesCancelled = 0;
+        for (String requestId : _processedRequestIds) {
+            ServerlessHttpFuture future = futures.get(requestId);
+            if (future != null) {
+                // TODO: Change this to trace.
+                if (LOG.isDebugEnabled()) LOG.debug("Cancelling future associated with HTTP request " + requestId);
+                future.cancel(true);
+                totalNumFuturesCancelled++;
+            }
+        }
+
+        if (LOG.isDebugEnabled()) LOG.debug("Cancelled " + totalNumFuturesCancelled + "/" +
+                _processedRequestIds.size() + " future(s).");
     }
 
     /**
@@ -566,8 +644,7 @@ public abstract class ServerlessInvokerBase {
             throw new IllegalStateException("Serverless Invoker has not yet been configured! " +
                     "You must configure it by calling .setConfiguration(...) before using it.");
 
-        // This is the top-level JSON object passed along with the HTTP POST request.
-        JsonObject requestArguments = new JsonObject();
+        if (LOG.isDebugEnabled()) LOG.debug("Creating and enqueuing request " + requestId + "(op=" + operationName + ") targeting deployment " + targetDeployment);
 
         // We pass the file system operation arguments to the NameNode, as it
         // will hand them off to the intended file system operation function.
@@ -578,20 +655,29 @@ public abstract class ServerlessInvokerBase {
         nameNodeArguments.addProperty(ServerlessNameNodeKeys.INVOKER_IDENTITY, invokerIdentity);
         nameNodeArguments.addProperty(REQUEST_ID, requestId);
 
-        // OpenWhisk expects the arguments for the serverless function handler to be included in the JSON contained
-        // within the HTTP POST request. They should be included with the key "value".
-        requestArguments.add(ServerlessNameNodeKeys.VALUE, nameNodeArguments);
-
         // TODO: Eventually switch this to trace rather than debug.
         if (LOG.isDebugEnabled()) LOG.debug("Enqueuing HTTP request " + requestId +
                 " for submission with deployment " + targetDeployment);
-        enqueueRequest(requestArguments, targetDeployment);
+        enqueueRequest(nameNodeArguments, targetDeployment);
 
-        return new ServerlessHttpFuture(requestId, operationName);
+        ServerlessHttpFuture future = new ServerlessHttpFuture(requestId, operationName);
+        futures.put(requestId, future);
+        return future;
     }
 
     /**
-     * Helper function to issue an HTTP request with retries.
+     * Mark a particular request as complete. This just amounts to remove the future associated with the request from
+     * the future mapping. This should be called by clients once they've received a correct result for their request.
+     *
+     * @param requestId the request ID of the request we're marking as complete.
+     */
+    public void markComplete(String requestId) {
+        futures.remove(requestId);
+    }
+
+    /**
+     * Helper function to issue an HTTP request with retries. This is how HTTP requests should be issued, as it
+     * provides for exception handling and exponential backoff for retries.
      *
      * @param invokerInstance The {@link ServerlessInvokerBase} class to use to invoke the serverless function.
      * @param operationName The FS operation being performed. This is passed to the NameNode so that it knows which of
@@ -623,6 +709,9 @@ public abstract class ServerlessInvokerBase {
             throws IOException {
         long invokeStart = System.nanoTime();
 
+        if (targetDeployment == -1)
+            targetDeployment = rng.nextInt(invokerInstance.numDeployments);
+
         ExponentialBackOff exponentialBackoff = new ExponentialBackOff.Builder()
                 .setMaximumRetries(invokerInstance.maxHttpRetries)
                 .setInitialIntervalMillis(10000)
@@ -634,11 +723,11 @@ public abstract class ServerlessInvokerBase {
         if (LOG.isDebugEnabled()) {
             double timeElapsed = (System.nanoTime() - invokeStart) / 1.0e6;
             LOG.debug("Issuing HTTP request " + requestId + " to deployment " + targetDeployment + ", attempt " +
-                    (exponentialBackoff.getNumberOfRetries() - 1) + "/" + invokerInstance.maxHttpRetries +
+                    (exponentialBackoff.getNumberOfRetries()+1) + "/" + invokerInstance.maxHttpRetries +
                     ". Time elapsed: " + timeElapsed + " milliseconds.");
         } else {
             LOG.info("Issuing HTTP request " + requestId + " to deployment " + targetDeployment + ", attempt " +
-                    (exponentialBackoff.getNumberOfRetries() - 1) + "/" + invokerInstance.maxHttpRetries + ".");
+                    (exponentialBackoff.getNumberOfRetries()+1) + "/" + invokerInstance.maxHttpRetries + ".");
         }
 
         long backoffInterval = exponentialBackoff.getBackOffInMillis();
@@ -682,6 +771,9 @@ public abstract class ServerlessInvokerBase {
                             + "Encountered unexpected " + genericExceptionType + " while invoking NN.");
                 }
             } else {
+                // Received a valid result. Return it to the client.
+                // First though, we should mark the request as complete.
+                invokerInstance.markComplete(requestId);
                 return response;
             }
         } while (backoffInterval > 0);
@@ -708,6 +800,7 @@ public abstract class ServerlessInvokerBase {
         request.setEntity(parameters);
         request.setHeader(HttpHeaders.CONTENT_TYPE, "application/json");
 
+        // Future<HttpResponse> future =
         httpClient.execute(request, new FutureCallback<HttpResponse>() {
             @Override
             public void completed(HttpResponse httpResponse) {
@@ -718,6 +811,7 @@ public abstract class ServerlessInvokerBase {
                     double timeElapsed = (currentTime - invokeStart) / 1.0e6;
                     LOG.debug("Received HTTP " + responseCode +
                             " response code. Time elapsed: " + timeElapsed + " milliseconds.");
+                    LOG.debug("httpResponse = " + httpResponse);
                 }
 
                 if (responseCode >= 400 && responseCode <= 599) {
@@ -739,7 +833,8 @@ public abstract class ServerlessInvokerBase {
 
                 try {
                     // Extract the payload from the HTTP response.
-                    JsonObject result = processHttpResponse(httpResponse);
+                    JsonObject httpResponseAsJson = processHttpResponse(httpResponse);
+                    JsonObject result = httpResponseAsJson.get("body").getAsJsonObject();
 
                     // For each of the individual requests in the batch, post an error message to the future.
                     // This way, the client can be notified of the failure and retry the request if desired.
@@ -760,16 +855,23 @@ public abstract class ServerlessInvokerBase {
             @Override
             public void failed(Exception e) {
                 LOG.error("Batched HTTP request containing " + requestIds.size() +
-                        " individual request(s) has failed. Request IDs: " + StringUtils.join(", ", requestIds));
+                        " individual request(s) has failed. Request IDs: " +
+                        StringUtils.join(", ", requestIds) + ". Reason for failure:", e);
 
                 for (String requestId : requestIds) {
                     ServerlessHttpFuture future = futures.get(requestId);
+
+                    if (future == null) {
+                        LOG.error("Cannot locate Future for request " + requestId + "...");
+                        continue;
+                    }
+
                     JsonObject response = new JsonObject();
 
                     if (e != null)
-                        response.addProperty("EXCEPTION_TYPE", e.getClass().getSimpleName());
+                        response.addProperty(LOCAL_EXCEPTION, e.getClass().getSimpleName());
                     else
-                        response.addProperty("EXCEPTION_TYPE", "GENERIC/UNKNOWN");
+                        response.addProperty(LOCAL_EXCEPTION, "GENERIC/UNKNOWN");
 
                     future.postResultImmediate(response);
                 }
@@ -781,6 +883,15 @@ public abstract class ServerlessInvokerBase {
                 request.releaseConnection();
             }
         });
+
+//        LOG.debug("Getting response from Future<HttpResponse> now...");
+//        try {
+//            HttpResponse response = future.get();
+//            JsonObject result = processHttpResponse(response);
+//            LOG.debug("Got HttpResponse: " + result);
+//        } catch (InterruptedException | ExecutionException e) {
+//            e.printStackTrace();
+//        }
     }
 
     /**
@@ -820,7 +931,6 @@ public abstract class ServerlessInvokerBase {
         };
 
         TrustStrategy acceptingTrustStrategy = (x509Certificates, s) -> {
-            //LOG.debug("Checking if certificates " + x509Certificates + " are trusted. String s: " + s + ".");
             return true;
         };
         SSLContext sslContext = org.apache.http.ssl.SSLContexts.custom().loadTrustMaterial(null, acceptingTrustStrategy).build();
@@ -928,7 +1038,7 @@ public abstract class ServerlessInvokerBase {
                 TransactionsStats.ServerlessStatisticsPackage statisticsPackage =
                         (TransactionsStats.ServerlessStatisticsPackage)
                                 InvokerUtilities.base64StringToObject(statisticsPackageEncoded);
-                this.statisticsPackages.put(requestId, statisticsPackage);
+                statisticsPackages.put(requestId, statisticsPackage);
             } catch (Exception ex) {
                 LOG.error("Error encountered while extracting statistics packages from NameNode response:", ex);
                 return null;
@@ -943,7 +1053,7 @@ public abstract class ServerlessInvokerBase {
             try {
                 List<TransactionEvent> txEvents =
                         (List<TransactionEvent>) InvokerUtilities.base64StringToObject(transactionEventsEncoded);
-                this.transactionEvents.put(requestId, txEvents);
+                transactionEvents.put(requestId, txEvents);
             } catch (Exception ex) {
                 LOG.error("Error encountered while extracting transaction events from NameNode response:", ex);
                 return null;
@@ -972,31 +1082,6 @@ public abstract class ServerlessInvokerBase {
 
         return null;
     }
-
-    /**
-     * Redirect a received request to another NameNode. This is useful when a client issues a write request to
-     * a deployment that is not authorized to perform writes on the target file/directory.
-     *
-     * @param operationName The FS operation being performed. This is passed to the NameNode so that it knows which of
-     *                      its functions it should execute. This is sort of taking the place of the RPC mechanism,
-     *                      where ordinarily you'd just invoke an RPC method.
-     * @param nameNodeArguments Arguments for the Name Node itself. These would traditionally be passed as command line
-     *                          arguments when using a serverful name node. We generally don't need to pass anything
-     *                          for this parameter.
-     * @param fileSystemOperationArguments The parameters to the FS operation. Specifically, these are the arguments
-     *                                     to the Java function which performs the FS operation. The NameNode will
-     *                                     extract these after it sees what function it is supposed to execute. These
-     *                                     would traditionally just be passed as arguments to the RPC call, but we
-     *                                     aren't using RPC.
-     * @param requestId The unique ID used to match this request uniquely against its corresponding TCP request. If
-     *                  passed a null, then a random ID is generated.
-     * @param targetDeployment Specify the deployment to target. Use -1 to use the cache or a random deployment if no
-     *                         cache entry exists.
-     * @return The response from the Serverless NameNode.
-     */
-    public abstract ServerlessHttpFuture redirectRequest(String operationName, JsonObject nameNodeArguments,
-                                      JsonObject fileSystemOperationArguments, String requestId,
-                                      int targetDeployment) throws IOException;
 
     /**
      * Set the name of the client using this invoker (e.g., the `clientName` field of the DFSClient class).
@@ -1074,12 +1159,12 @@ public abstract class ServerlessInvokerBase {
             throw new IllegalStateException("TCP Port has not been initialized to correct value.");
 
         JsonArray tcpPortsJson = new JsonArray();
-        List<Integer> tcpPorts = UserServerManager.getInstance().getActiveTcpPorts();
+        List<Integer> tcpPorts = ServerAndInvokerManager.getInstance().getActiveTcpPorts();
         for (int tcpPort : tcpPorts)
             tcpPortsJson.add(tcpPort);
 
         JsonArray udpPortsJson = new JsonArray();
-        List<Integer> udpPorts = udpEnabled ? UserServerManager.getInstance().getActiveUdpPorts() : new ArrayList<>();
+        List<Integer> udpPorts = udpEnabled ? ServerAndInvokerManager.getInstance().getActiveUdpPorts() : new ArrayList<>();
         for (int udpPort : udpPorts)
             udpPortsJson.add(udpPort);
 
@@ -1104,19 +1189,27 @@ public abstract class ServerlessInvokerBase {
     // DEBUGGING/METRICS //
     ///////////////////////
 
-    public HashMap<String, TransactionsStats.ServerlessStatisticsPackage> getStatisticsPackages() {
+    public static ConcurrentHashMap<String, TransactionsStats.ServerlessStatisticsPackage> getStatisticsPackages() {
         return statisticsPackages;
     }
 
-    public void setStatisticsPackages(HashMap<String, TransactionsStats.ServerlessStatisticsPackage> packages) {
-        this.statisticsPackages = packages;
+    public static void setStatisticsPackages(ConcurrentHashMap<String, TransactionsStats.ServerlessStatisticsPackage> packages) {
+        statisticsPackages = packages;
     }
 
-    public HashMap<String, List<TransactionEvent>> getTransactionEvents() {
+    public static ConcurrentHashMap<String, List<TransactionEvent>> getTransactionEvents() {
         return transactionEvents;
     }
 
-    public void setTransactionEvents(HashMap<String, List<TransactionEvent>> transactionEvents) {
-        this.transactionEvents = transactionEvents;
+    public static void setTransactionEvents(ConcurrentHashMap<String, List<TransactionEvent>> txEvents) {
+        transactionEvents = txEvents;
+    }
+
+    public static void clearStatisticsPackages() {
+        statisticsPackages.clear();
+    }
+
+    public static void clearTransactionEvents() {
+        transactionEvents.clear();
     }
 }

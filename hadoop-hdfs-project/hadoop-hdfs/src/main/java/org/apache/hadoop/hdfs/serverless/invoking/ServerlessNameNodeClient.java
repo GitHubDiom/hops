@@ -34,11 +34,12 @@ import org.apache.hadoop.hdfs.serverless.OpenWhiskHandler;
 import org.apache.hadoop.hdfs.serverless.ServerlessNameNodeKeys;
 import io.hops.metrics.OperationPerformed;
 import org.apache.hadoop.hdfs.serverless.exceptions.TcpRequestCancelledException;
+import org.apache.hadoop.hdfs.serverless.execution.futures.ServerlessHttpFuture;
 import org.apache.hadoop.hdfs.serverless.execution.results.CancelledResult;
 import org.apache.hadoop.hdfs.serverless.execution.results.NameNodeResult;
 import org.apache.hadoop.hdfs.serverless.execution.results.NameNodeResultWithMetrics;
 import org.apache.hadoop.hdfs.serverless.execution.results.ServerlessFunctionMapping;
-import org.apache.hadoop.hdfs.serverless.userserver.UserServerManager;
+import org.apache.hadoop.hdfs.serverless.userserver.ServerAndInvokerManager;
 import org.apache.hadoop.hdfs.serverless.userserver.UserServer;
 import org.apache.hadoop.hdfs.serverless.userserver.TcpUdpRequestPayload;
 import org.apache.hadoop.hdfs.serverless.execution.futures.ServerlessFuture;
@@ -62,21 +63,20 @@ import java.util.concurrent.*;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.*;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.SERVERLESS_PLATFORM_DEFAULT;
 import static org.apache.hadoop.hdfs.serverless.ServerlessNameNodeKeys.*;
+import static org.apache.hadoop.hdfs.serverless.invoking.ServerlessUtilities.getFunctionNumberForFileOrDirectory;
 
 /**
  * This serves as an adapter between the DFSClient interface and the serverless NameNode API.
  *
  * This basically enables the DFSClient code to remain unmodified; it just issues its commands
  * to an instance of this class, which transparently handles the serverless invoking code.
+ *
+ * TODO(ben): Modify all the methods which grab data from Invokers to grab data from all Invokers,
+ *            since there will now be multiple invoker instances. Maybe just make the statistics packages
+ *            and transaction events static, so that they're implicitly shared across all instances.
  */
 public class ServerlessNameNodeClient implements ClientProtocol {
-
     public static final Log LOG = LogFactory.getLog(ServerlessNameNodeClient.class);
-
-    /**
-     * Responsible for invoking the Serverless NameNode(s).
-     */
-    public ServerlessInvokerBase serverlessInvoker;
 
     /**
      * Issue HTTP requests to this to invoke serverless functions.
@@ -86,6 +86,8 @@ public class ServerlessNameNodeClient implements ClientProtocol {
      * PREFIX is user-specified/user-configured.
      */
     public String serverlessEndpointBase;
+
+    private final static Random rng = new Random();
 
     /**
      * The name of the serverless platform being used for the Serverless NameNodes.
@@ -108,6 +110,13 @@ public class ServerlessNameNodeClient implements ClientProtocol {
      * Flag that dictates whether TCP requests can be used to perform FS operations.
      */
     private final boolean tcpEnabled;
+
+    /**
+     * true if this client has registered with the {@link ServerAndInvokerManager} instance.
+     * Registration involves being assigned {@link UserServer} and {@link ServerlessInvokerBase} instances.
+     * The client needs to have been assigned these instances before it can issue any requests.
+     */
+    // private boolean registeredWithServerInvokerManager = false;
 
     /**
      * Not really used by this class. Just used for debugging.
@@ -173,9 +182,9 @@ public class ServerlessNameNodeClient implements ClientProtocol {
     private final int latencyWindowSize;
 
     /**
-     * The singleton {@link UserServerManager} instance. Used to register this client with a TCP server.
+     * The singleton {@link ServerAndInvokerManager} instance. Used to register this client with a TCP server.
      */
-    private final UserServerManager userServerManager;
+    private final ServerAndInvokerManager serverAndInvokerManager;
 
     /**
      * If enabled, then the client will randomly issue an HTTP request, even when TCP is available. The
@@ -227,7 +236,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
      * When enabled, clients using a newly-created TCP server can piggy-back off of existing connections of other
      * TCP servers running within the same VM. This prevents too many HTTP requests from being issued all-at-once.
      */
-    private boolean connectionSharingEnabled;
+    private final boolean connectionSharingEnabled;
 
     /**
      * The likelihood that connection sharing occurs when one's own TCP server does not have an active connection
@@ -235,7 +244,12 @@ public class ServerlessNameNodeClient implements ClientProtocol {
      *
      * This is the probability that it DOES occur.
      */
-    private double connectionSharingProbability;
+    private final double connectionSharingProbability;
+
+    /**
+     * Responsible for invoking the Serverless NameNode(s).
+     */
+    private ServerlessInvokerBase serverlessInvoker;
 
     /**
      * Maximum number of attempts to issue a TCP/UDP request before falling back to HTTP.
@@ -248,11 +262,12 @@ public class ServerlessNameNodeClient implements ClientProtocol {
      * IMPORTANT: The {@link ServerlessNameNodeClient#registerAndStartTcpServer()} function must be called after
      * instantiating an instance of this class.
      *
-     * @param conf The configuration used for the client. This also gets passed to the {@link UserServerManager} and
+     * @param conf The configuration used for the client. This also gets passed to the {@link ServerAndInvokerManager} and
      *             subsequently the {@link UserServer} instances.
      * @param dfsClient The {@link DFSClient} instance instantiating us.
      */
     public ServerlessNameNodeClient(Configuration conf, DFSClient dfsClient) throws IOException {
+        if (LOG.isDebugEnabled()) LOG.debug("Creating new ServerlessNameNodeClient for DFSClient " + dfsClient.getClientName());
         // "https://127.0.0.1:443/api/v1/web/whisk.system/default/namenode?blocking=true";
         serverlessEndpointBase = dfsClient.serverlessEndpoint;
         serverlessPlatformName = conf.get(SERVERLESS_PLATFORM, SERVERLESS_PLATFORM_DEFAULT);
@@ -301,15 +316,10 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         LOG.debug("Random HTTP " + (randomHttpEnabled ? "enabled." : "disabled.") +
                 " HTTP Chance: " + randomHttpChance);
 
-        this.serverlessInvoker = dfsClient.serverlessInvoker;
-
-        // This should already be set to true in the DFSClient class.
-        this.serverlessInvoker.setIsClientInvoker(true);
-
         this.dfsClient = dfsClient;
 
-        userServerManager = UserServerManager.getInstance();
-        userServerManager.setConfiguration(conf);
+        serverAndInvokerManager = ServerAndInvokerManager.getInstance();
+        serverAndInvokerManager.setConfiguration(conf);
 
         // COMMENTED OUT:
         // This is now performed in the `registerAndStartTcpServer()` function.
@@ -324,13 +334,17 @@ public class ServerlessNameNodeClient implements ClientProtocol {
 
     public void setBenchmarkModeEnabled(boolean benchmarkModeEnabled) {
         this.benchmarkModeEnabled = benchmarkModeEnabled;
-        this.serverlessInvoker.benchmarkModeEnabled = benchmarkModeEnabled;
+
+        if (this.serverlessInvoker != null)
+            this.serverlessInvoker.setBenchmarkModeEnabled(benchmarkModeEnabled);
     }
 
     /**
      * Return the ZooKeeper client.
      */
     public ZKClient getZkClient() { return this.zkClient; }
+
+    public boolean isTcpEnabled() { return tcpEnabled; }
 
     /**
      * Extract the result from the NN.
@@ -369,7 +383,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
                 NameNodeResultWithMetrics nameNodeResultWithMetrics = (NameNodeResultWithMetrics)result;
                 List<TransactionEvent> txEvents = nameNodeResultWithMetrics.getTxEvents();
                 if (txEvents != null) {
-                    this.serverlessInvoker.transactionEvents.put(nameNodeResultWithMetrics.getRequestId(), txEvents);
+                    ServerlessInvokerBase.getTransactionEvents().put(nameNodeResultWithMetrics.getRequestId(), txEvents);
                 }
             }
 
@@ -383,28 +397,44 @@ public class ServerlessNameNodeClient implements ClientProtocol {
     }
 
     /**
-     * Register with the {@link UserServerManager} instance. Gets the TCP server this client will be using.
+     * Register with the {@link ServerAndInvokerManager} instance. Gets the TCP server this client will be using.
      *
      * This should be called outside this class' constructor. Specifically, whoever instantiates an instance of
      * {@link ServerlessNameNodeClient} must call this function after instantiating the instance.
      */
     public void registerAndStartTcpServer() throws IOException {
+        if (LOG.isDebugEnabled()) LOG.debug("Registering client " + dfsClient.getClientName() + " with serverAndInvokerManager now...");
         // This function calls start on the server if necessary, so we don't need to do anything.
-        this.tcpServer = userServerManager.registerWithTcpServer(this);
+        Pair<UserServer, ServerlessInvokerBase> pair = serverAndInvokerManager.registerClient(
+                this, dfsClient.getClientName(), serverlessEndpointBase);
+
+        this.tcpServer = pair.getFirst();
+        this.serverlessInvoker = pair.getSecond();
+
+        assert(this.tcpServer != null);
+        assert(this.serverlessInvoker != null);
+
+        // this.registeredWithServerInvokerManager = true;
     }
 
     public void setConsistencyProtocolEnabled(boolean enabled) {
         this.consistencyProtocolEnabled = enabled;
-        this.serverlessInvoker.setConsistencyProtocolEnabled(enabled);
+        if (this.serverlessInvoker != null)
+            this.serverlessInvoker.setConsistencyProtocolEnabled(enabled);
     }
 
     public boolean getConsistencyProtocolEnabled() {
         return consistencyProtocolEnabled;
     }
 
+    public boolean getBenchmarkModeEnabled() {
+        return benchmarkModeEnabled;
+    }
+
     public void setServerlessFunctionLogLevel(String logLevel) {
         this.serverlessFunctionLogLevel = logLevel;
-        this.serverlessInvoker.setServerlessFunctionLogLevel(logLevel);
+        if (this.serverlessInvoker != null)
+            this.serverlessInvoker.setServerlessFunctionLogLevel(logLevel);
     }
 
     public String getServerlessFunctionLogLevel() {
@@ -412,7 +442,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
     }
 
     public int printDebugInformation() {
-        return this.userServerManager.printDebugInformation();
+        return this.serverAndInvokerManager.printDebugInformation();
     }
 
     /**
@@ -553,8 +583,8 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         // This contains the file system operation arguments (and everything else) that will be submitted to the NN.
         TcpUdpRequestPayload tcpRequestPayload = new TcpUdpRequestPayload(requestId, operationName,
                 consistencyProtocolEnabled, OpenWhiskHandler.getLogLevelIntFromString(serverlessFunctionLogLevel),
-                opArguments.getAllArguments(), benchmarkModeEnabled, userServerManager.getActiveTcpPorts(),
-                udpEnabled ? userServerManager.getActiveUdpPorts() : null);
+                opArguments.getAllArguments(), benchmarkModeEnabled, serverAndInvokerManager.getActiveTcpPorts(),
+                udpEnabled ? serverAndInvokerManager.getActiveUdpPorts() : null);
 
         boolean stragglerResubmissionAlreadyOccurred = false;
         boolean wasResubmittedViaStragglerMitigation = false;
@@ -696,7 +726,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
 
             // Random HTTP-TCP replacement. See comment above for more detailed explanation.
             if (!randomHttpEnabled || Math.random() > randomHttpChance)
-                targetServer = userServerManager.findServerWithActiveConnectionToDeployment(targetDeploymentTcp);
+                targetServer = serverAndInvokerManager.findServerWithActiveConnectionToDeployment(targetDeploymentTcp);
 
             if (LOG.isTraceEnabled()) {
                 if (targetServer != null)
@@ -715,18 +745,12 @@ public class ServerlessNameNodeClient implements ClientProtocol {
      * serverless platform is being used).
      *
      * @param operationName The name of the FS operation that the NameNode should perform.
-     * @param serverlessEndpoint The (base) OpenWhisk URI of the serverless NameNode(s).
-     * @param nameNodeArguments The command-line arguments to be given to the NN, should it be created within the NN
-     *                          function container (i.e., during a cold start).
      * @param opArguments The arguments to be passed to the specified file system operation.
      *
      * @return The result of executing the desired FS operation on the NameNode.
      */
-    private Object submitOperationToNameNode(
-            String operationName,
-            String serverlessEndpoint,
-            HashMap<String, Object> nameNodeArguments,
-            ArgumentContainer opArguments) throws IOException, InterruptedException, ExecutionException {
+    private Object submitOperationToNameNode(String operationName, ArgumentContainer opArguments)
+            throws IOException, InterruptedException, ExecutionException {
         // Check if there's a source directory parameter, as this is the file or directory that could
         // potentially be mapped to a serverless function.
         Object srcArgument = opArguments.get(ServerlessNameNodeKeys.SRC);
@@ -744,7 +768,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         String sourceFileOrDirectory;
         if (srcArgument != null) {
             sourceFileOrDirectory = (String)srcArgument;
-            targetDeployment = serverlessInvoker.getFunctionNumberForFileOrDirectory(sourceFileOrDirectory);
+            targetDeployment = getFunctionNumberForFileOrDirectory(sourceFileOrDirectory, numDeployments);
         }
 
         // If tcpEnabled is false, we don't even bother checking to see if we can issue a TCP request.
@@ -753,6 +777,10 @@ public class ServerlessNameNodeClient implements ClientProtocol {
             // So, if we have to fall back to HTTP, we just use the targetDeployment variable. TCP
             // may modify this variable to be -1, so we have a separate value for it.
             int targetDeploymentTcp = targetDeployment;
+
+            // Randomly select a deployment if the user did not specify one.
+            if (targetDeploymentTcp == -1)
+                targetDeploymentTcp = rng.nextInt(numDeployments);
 
             // Used for metrics and debugging. This only gets updated when a request fails.
             // If we successfully issue a TCP request, then its value will still be 0.
@@ -786,7 +814,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
                     else if (connectionSharingEnabled) {
                         // If it is enabled, then we do it 100% of the time due to anti-thrashing.
                         if (LOG.isTraceEnabled()) LOG.trace("Attempting to use Connection Sharing in conjunction with Anti-Thrashing mode.");
-                        targetServer = userServerManager.findServerWithAtLeastOneActiveConnection();
+                        targetServer = serverAndInvokerManager.findServerWithAtLeastOneActiveConnection();
                     }
                 }
 
@@ -830,22 +858,8 @@ public class ServerlessNameNodeClient implements ClientProtocol {
 
         long startTime = System.currentTimeMillis();
 
-        // If there is no "source" file/directory argument, or if there was no existing mapping for the given source
-        // file/directory, then we'll just use an HTTP request.
-//        ServerlessHttpFuture future = dfsClient.serverlessInvoker.invokeNameNodeViaHttpPost(
-//                operationName, dfsClient.serverlessEndpoint,
-//                null, // We do not have any additional/non-default arguments to pass to the NN.
-//                opArguments, requestId, targetDeployment);
-//
-//        JsonObject response = null;
-//        try {
-//            response = future.get();
-//        } catch (ExecutionException | InterruptedException ex) {
-//            LOG.error("Exception encountered while waiting for result of HTTP request " + requestId + ":", ex);
-//        }
-
         JsonObject response = ServerlessInvokerBase.issueHttpRequestWithRetries(
-                dfsClient.serverlessInvoker, operationName, dfsClient.serverlessEndpoint,
+                serverlessInvoker, operationName, dfsClient.serverlessEndpoint,
                 null, opArguments, requestId, targetDeployment);
 
         if (response == null)
@@ -967,6 +981,8 @@ public class ServerlessNameNodeClient implements ClientProtocol {
     public List<OperationPerformed> getOperationsPerformed() {
         return new ArrayList<>(operationsPerformed.values());
     }
+
+    public ServerlessInvokerBase getServerlessInvoker() { return this.serverlessInvoker; }
 
     /**
      * Clear the collection of operations performed.
@@ -1290,8 +1306,9 @@ public class ServerlessNameNodeClient implements ClientProtocol {
             LOG.debug("ServerlessNameNodeClient stopping now...");
 
         if (this.tcpServer != null)
-            this.userServerManager.unregisterClient(this.tcpServer.getTcpPort());
-        // this.tcpServer.stop();
+            this.serverAndInvokerManager.unregisterClient(this.tcpServer.getTcpPort());
+
+        // TODO: Determine when to call terminate() on the serverAndInvokerManager instance.
     }
 
     @Override
@@ -1315,8 +1332,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             responseFromNN = submitOperationToNameNode(
                     "getBlockLocations",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation getBlockLocations to NameNode:", ex);
@@ -1353,8 +1369,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             responseFromNN = submitOperationToNameNode(
                     "getServerDefaults",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     new ArgumentContainer());
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation getServerDefaults to NameNode:", ex);
@@ -1410,8 +1425,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             responseFromNN = submitOperationToNameNode(
                     "create",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation create to NameNode:", ex);
@@ -1458,8 +1472,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             responseFromNN = submitOperationToNameNode(
                     "append",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation append to NameNode:", ex);
@@ -1505,8 +1518,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             submitOperationToNameNode(
                     "setMetaStatus",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation setMetaStatus to NameNode:", ex);
@@ -1523,8 +1535,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             submitOperationToNameNode(
                     "setPermission",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation setPermission to NameNode:", ex);
@@ -1542,8 +1553,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             submitOperationToNameNode(
                     "setOwner",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation setOwner to NameNode:", ex);
@@ -1562,8 +1572,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             submitOperationToNameNode(
                     "abandonBlock",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation abandonBlock to NameNode:", ex);
@@ -1587,8 +1596,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             responseFromNN = submitOperationToNameNode(
                     "addBlock",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation addBlock to NameNode:", ex);
@@ -1630,8 +1638,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             responseFromNN = submitOperationToNameNode(
                     "complete",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation complete to NameNode:", ex);
@@ -1666,8 +1673,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             submitOperationToNameNode(
                     "rename",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation rename to NameNode:", ex);
@@ -1687,8 +1693,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             submitOperationToNameNode(
                     "concat",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation concat to NameNode:", ex);
@@ -1713,8 +1718,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             submitOperationToNameNode(
                     "rename", // Not rename2, we just map 'rename' to 'renameTo' or 'rename2' or whatever
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation rename to NameNode:", ex);
@@ -1733,8 +1737,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             responseFromNN = submitOperationToNameNode(
                     "truncate",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation truncate to NameNode:", ex);
@@ -1759,8 +1762,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             responseFromNN = submitOperationToNameNode(
                     "delete",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation delete to NameNode:", ex);
@@ -1786,8 +1788,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             responseFromNN = submitOperationToNameNode(
                     "mkdirs",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation mkdirs to NameNode:", ex);
@@ -1813,8 +1814,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             responseFromNN = submitOperationToNameNode(
                     "getListing",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation getListing to NameNode:", ex);
@@ -1837,8 +1837,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             submitOperationToNameNode(
                     "renewLease",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation getListing to NameNode:", ex);
@@ -1859,8 +1858,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             responseFromNN = submitOperationToNameNode(
                     "getStats",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation getListing to NameNode:", ex);
@@ -1884,8 +1882,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             responseFromNN = submitOperationToNameNode(
                     "getDatanodeReport",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation getListing to NameNode:", ex);
@@ -1944,8 +1941,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             responseFromNN = submitOperationToNameNode(
                     "getFileInfo",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation getFileInfo to NameNode:", ex);
@@ -1969,8 +1965,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             responseFromNN = submitOperationToNameNode(
                     "isFileClosed",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation isFileClosed to NameNode:", ex);
@@ -1994,8 +1989,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             responseFromNN = submitOperationToNameNode(
                     "getFileLinkInfo",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation getFileLinkInfo to NameNode:", ex);
@@ -2050,8 +2044,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             responseFromNN = submitOperationToNameNode(
                     "updateBlockForPipeline",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation complete to NameNode:", ex);
@@ -2079,8 +2072,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             submitOperationToNameNode(
                     "updatePipeline",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation complete to NameNode:", ex);
@@ -2132,14 +2124,15 @@ public class ServerlessNameNodeClient implements ClientProtocol {
                         // If there is no "source" file/directory argument, or if there was no existing mapping for the given source
                         // file/directory, then we'll just use an HTTP request.
                         try {
-                            dfsClient.serverlessInvoker.enqueueHttpRequest(
+                            ServerlessHttpFuture future = serverlessInvoker.enqueueHttpRequest(
                                     "prewarm",
                                     dfsClient.serverlessEndpoint,
                                     null, // We do not have any additional/non-default arguments to pass to the NN.
                                     new ArgumentContainer(),
                                     requestId,
                                     depNum);
-                        } catch (IOException e) {
+                            future.get();
+                        } catch (IOException | InterruptedException | ExecutionException e) {
                             e.printStackTrace();
                         }
                     }
@@ -2167,13 +2160,19 @@ public class ServerlessNameNodeClient implements ClientProtocol {
 
         // If there is no "source" file/directory argument, or if there was no existing mapping for the given source
         // file/directory, then we'll just use an HTTP request.
-        dfsClient.serverlessInvoker.enqueueHttpRequest(
+        ServerlessHttpFuture future = serverlessInvoker.enqueueHttpRequest(
                 "ping",
                 dfsClient.serverlessEndpoint,
                 null, // We do not have any additional/non-default arguments to pass to the NN.
                 new ArgumentContainer(),
                 requestId,
                 targetDeployment);
+
+        try {
+            future.get();
+        } catch (InterruptedException | ExecutionException e) {
+            e.printStackTrace();
+        }
     }
 
     @Override
@@ -2184,8 +2183,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             responseFromNN = submitOperationToNameNode(
                     "getActiveNamenodesForClient",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation complete to NameNode:", ex);
@@ -2347,8 +2345,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             submitOperationToNameNode(
                     "addUser",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation addUser to NameNode:", ex);
@@ -2364,8 +2361,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             submitOperationToNameNode(
                     "addGroup",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation addGroup to NameNode:", ex);
@@ -2382,8 +2378,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             submitOperationToNameNode(
                     "addUserToGroup",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation addUserToGroup to NameNode:", ex);
@@ -2399,8 +2394,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             submitOperationToNameNode(
                     "removeUser",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation removeUser to NameNode:", ex);
@@ -2416,8 +2410,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             submitOperationToNameNode(
                     "removeGroup",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation removeGroup to NameNode:", ex);
@@ -2434,8 +2427,7 @@ public class ServerlessNameNodeClient implements ClientProtocol {
         try {
             submitOperationToNameNode(
                     "removeUserFromGroup",
-                    dfsClient.serverlessEndpoint,
-                    null, // We do not have any additional/non-default arguments to pass to the NN.
+                    // We do not have any additional/non-default arguments to pass to the NN.
                     opArguments);
         } catch (ExecutionException | InterruptedException ex) {
             LOG.error("Exception encountered while submitting operation removeUserFromGroup to NameNode:", ex);
@@ -2466,19 +2458,5 @@ public class ServerlessNameNodeClient implements ClientProtocol {
     @Override
     public long getEpochMS() throws IOException {
         return 0;
-    }
-
-    /**
-     * IMPORTANT: This function just calls setTcpServerPort() on the ServerlessInvoker instance.
-     */
-    public void setTcpServerPort(int tcpServerPort) {
-        this.serverlessInvoker.setTcpPort(tcpServerPort);
-    }
-
-    /**
-     * IMPORTANT: This function just calls setUdpServerPort() on the ServerlessInvoker instance.
-     */
-    public void setUdpServerPort(int udpServerPort) {
-        this.serverlessInvoker.setUdpPort(udpServerPort);
     }
 }

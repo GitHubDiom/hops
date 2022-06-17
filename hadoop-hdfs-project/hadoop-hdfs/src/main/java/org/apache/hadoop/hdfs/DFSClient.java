@@ -21,6 +21,7 @@ import java.security.GeneralSecurityException;
 import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -113,6 +114,7 @@ import org.apache.hadoop.hdfs.serverless.invoking.ServerlessNameNodeClient;
 import org.apache.hadoop.hdfs.serverless.invoking.ServerlessInvokerBase;
 import org.apache.hadoop.hdfs.serverless.invoking.ServerlessInvokerFactory;
 import io.hops.metrics.OperationPerformed;
+import org.apache.hadoop.hdfs.serverless.userserver.ServerAndInvokerManager;
 import org.apache.hadoop.io.DataOutputBuffer;
 import org.apache.hadoop.io.EnumSetWritable;
 import org.apache.hadoop.io.IOUtils;
@@ -181,11 +183,6 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
   public static final Log LOG = LogFactory.getLog(DFSClient.class);
   public static final long SERVER_DEFAULTS_VALIDITY_PERIOD = 60 * 60 * 1000L; // 1 hour
   static final int TCP_WINDOW_SIZE = 128 * 1024; // 128 KB
-
-  /**
-   * Responsible for invoking the Serverless NameNode(s).
-   */
-  public ServerlessInvokerBase serverlessInvoker;
 
   /**
    * Issue HTTP requests to this to invoke serverless functions.
@@ -274,14 +271,21 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
    * Clear the collection of statistics packages.
    */
   public void clearStatisticsPackages() {
-    this.serverlessInvoker.getStatisticsPackages().clear();
+//    if (this.namenode instanceof ServerlessNameNodeClient) {
+//      ((ServerlessNameNodeClient)this.namenode).getServerlessInvoker().getStatisticsPackages().clear();
+//    }
+    ServerlessInvokerBase.clearStatisticsPackages();
   }
 
   /**
    * Clear the mapping of transaction events.
    */
   public void clearTransactionStatistics() {
-    this.serverlessInvoker.getTransactionEvents().clear();
+//    if (this.namenode instanceof ServerlessNameNodeClient) {
+//      ((ServerlessNameNodeClient)this.namenode).getServerlessInvoker().getTransactionEvents().clear();
+//    }
+
+    ServerlessInvokerBase.clearTransactionEvents();
   }
 
   /**
@@ -333,13 +337,12 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
    *                  will overwrite the local keys. (In general, keys should not be overwritten as keys are
    *                  requestId values, which are supposed to be unique.)
    */
-  public void mergeStatisticsPackages(HashMap<String, TransactionsStats.ServerlessStatisticsPackage> packages,
-                                      boolean keepLocal) {
-    HashMap<String, TransactionsStats.ServerlessStatisticsPackage> local =
-            this.serverlessInvoker.getStatisticsPackages();
+  public synchronized void mergeStatisticsPackages(
+          ConcurrentHashMap<String, TransactionsStats.ServerlessStatisticsPackage> packages, boolean keepLocal) {
+    ConcurrentHashMap<String, TransactionsStats.ServerlessStatisticsPackage> merged = new ConcurrentHashMap<>();
 
-    HashMap<String, TransactionsStats.ServerlessStatisticsPackage> merged =
-            new HashMap<String, TransactionsStats.ServerlessStatisticsPackage>();
+    ConcurrentHashMap<String, TransactionsStats.ServerlessStatisticsPackage> local =
+            ServerlessInvokerBase.getStatisticsPackages();
 
     if (keepLocal) {
       merged.putAll(packages);
@@ -349,7 +352,7 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
       merged.putAll(packages);
     }
 
-    this.serverlessInvoker.setStatisticsPackages(merged);
+    ServerlessInvokerBase.setStatisticsPackages(merged);
   }
 
   /**
@@ -359,13 +362,13 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
    *                  will overwrite the local keys. (In general, keys should not be overwritten as keys are
    *                  requestId values, which are supposed to be unique.)
    */
-  public void mergeTransactionEvents(HashMap<String, List<TransactionEvent>> events,
+  public synchronized void mergeTransactionEvents(HashMap<String, List<TransactionEvent>> events,
                                       boolean keepLocal) {
-    HashMap<String, List<TransactionEvent>> local =
-            this.serverlessInvoker.getTransactionEvents();
+    ConcurrentHashMap<String, List<TransactionEvent>> local =
+            ServerlessInvokerBase.getTransactionEvents();
 
-    HashMap<String, List<TransactionEvent>> merged =
-            new HashMap<>();
+    ConcurrentHashMap<String, List<TransactionEvent>> merged =
+            new ConcurrentHashMap<>();
 
     if (keepLocal) {
       merged.putAll(events);
@@ -375,7 +378,33 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
       merged.putAll(events);
     }
 
-    this.serverlessInvoker.setTransactionEvents(merged);
+    ServerlessInvokerBase.setTransactionEvents(merged);
+  }
+
+  /**
+   * Merge the provided map of transaction events with our own.
+   *
+   * @param keepLocal If true, the local keys will be preserved. If false, the keys in the 'packages' parameter
+   *                  will overwrite the local keys. (In general, keys should not be overwritten as keys are
+   *                  requestId values, which are supposed to be unique.)
+   */
+  public synchronized void mergeTransactionEvents(ConcurrentHashMap<String, List<TransactionEvent>> events,
+                                     boolean keepLocal) {
+    ConcurrentHashMap<String, List<TransactionEvent>> local =
+            ServerlessInvokerBase.getTransactionEvents();
+
+    ConcurrentHashMap<String, List<TransactionEvent>> merged =
+            new ConcurrentHashMap<>();
+
+    if (keepLocal) {
+      merged.putAll(events);
+      merged.putAll(local);
+    } else {
+      merged.putAll(local);
+      merged.putAll(events);
+    }
+
+    ServerlessInvokerBase.setTransactionEvents(merged);
   }
 
   public void setBenchmarkModeEnabled(boolean benchmarkModeEnabled) {
@@ -388,25 +417,24 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
   /**
    * Return the statistics packages from the invoker.
    */
-  public HashMap<String, TransactionsStats.ServerlessStatisticsPackage> getStatisticsPackages() {
-    return this.serverlessInvoker.getStatisticsPackages();
+  public ConcurrentHashMap<String, TransactionsStats.ServerlessStatisticsPackage> getStatisticsPackages() {
+    return ServerlessInvokerBase.getStatisticsPackages();
   }
 
   /**
    * Return the transaction events from the invoker.
    */
-  public HashMap<String, List<TransactionEvent>> getTransactionEvents() {
-    return this.serverlessInvoker.getTransactionEvents();
+  public ConcurrentHashMap<String, List<TransactionEvent>> getTransactionEvents() {
+    return ServerlessInvokerBase.getTransactionEvents();
   }
 
   /**
    * Write the statistics packages to a file.
    * @param clearAfterWrite If true, clear the statistics packages after writing them.
    */
-  public void dumpStatisticsPackages(boolean clearAfterWrite)
-          throws IOException {
-    HashMap<String, TransactionsStats.ServerlessStatisticsPackage> statisticsPackages =
-            this.serverlessInvoker.getStatisticsPackages();
+  public void dumpStatisticsPackages(boolean clearAfterWrite) throws IOException {
+    ConcurrentHashMap<String, TransactionsStats.ServerlessStatisticsPackage> statisticsPackages =
+            ServerlessInvokerBase.getStatisticsPackages();
 
     LOG.debug("Writing " + statisticsPackages.size() + " statistics packages to files now...");
 
@@ -545,8 +573,6 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
   public DFSClient(URI nameNodeUri, Configuration conf,
                    FileSystem.Statistics stats)
           throws IOException {
-
-
     boolean localMode = conf.getBoolean(SERVERLESS_LOCAL_MODE, SERVERLESS_LOCAL_MODE_DEFAULT);
 
     if (localMode)
@@ -558,10 +584,6 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
 
     LOG.info("Serverless endpoint: " + serverlessEndpoint);
     LOG.info("Serverless platform: " + serverlessPlatformName);
-
-    this.serverlessInvoker = ServerlessInvokerFactory.getServerlessInvoker(serverlessPlatformName);
-    this.serverlessInvoker.setIsClientInvoker(true);
-    this.serverlessInvoker.setConfiguration(conf, "C-" + this.getClientName(), serverlessEndpoint);
 
     // Copy only the required DFSClient configuration
     this.tracer = FsTracer.get(conf);
@@ -585,7 +607,6 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
     }
     this.clientName = clientNamePrefix+ "_" + dfsClientConf.getTaskId() + "_" +
             DFSUtil.getRandom().nextInt() + "_" + Thread.currentThread().getId();
-    this.serverlessInvoker.setClientName(this.clientName);
     int numResponseToDrop = conf.getInt(
             DFSConfigKeys.DFS_CLIENT_TEST_DROP_NAMENODE_RESPONSE_NUM_KEY,
             DFSConfigKeys.DFS_CLIENT_TEST_DROP_NAMENODE_RESPONSE_NUM_DEFAULT);
@@ -718,10 +739,6 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
     LOG.info("Serverless endpoint: " + serverlessEndpoint);
     LOG.info("Serverless platform: " + serverlessPlatformName);
 
-    this.serverlessInvoker = ServerlessInvokerFactory.getServerlessInvoker(serverlessPlatformName);
-    this.serverlessInvoker.setIsClientInvoker(true);
-    this.serverlessInvoker.setConfiguration(conf, "C-" + getClientName(), serverlessEndpoint);
-
     this.ugi = UserGroupInformation.getCurrentUser();
 
     URI nameNodeUri = ServerlessNameNode.getUri(openWhiskEndpoint);
@@ -738,7 +755,6 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
     }
     this.clientName = clientNamePrefix+ "_" + dfsClientConf.getTaskId() + "_" +
             DFSUtil.getRandom().nextInt() + "_" + Thread.currentThread().getId();
-    this.serverlessInvoker.setClientName(this.clientName);
     int numResponseToDrop = conf.getInt(
             DFSConfigKeys.DFS_CLIENT_TEST_DROP_NAMENODE_RESPONSE_NUM_KEY,
             DFSConfigKeys.DFS_CLIENT_TEST_DROP_NAMENODE_RESPONSE_NUM_DEFAULT);
@@ -1144,8 +1160,6 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
       // close connections to the namenode
       closeConnectionsToNamenodes();
 
-      serverlessInvoker.terminate();
-
       // Stop the ServerlessNameNodeClient if that is what we're using as our ClientAPI name node.
       if (this.namenode instanceof ServerlessNameNodeClient) {
         ServerlessNameNodeClient serverlessNameNodeClient = (ServerlessNameNodeClient)this.namenode;
@@ -1254,8 +1268,8 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
     }
   }
 
-  private static Map<String, Boolean> localAddrMap =
-          Collections.synchronizedMap(new HashMap<String, Boolean>());
+  private static final Map<String, Boolean> localAddrMap =
+          Collections.synchronizedMap(new HashMap<>());
 
   public static boolean isLocalAddress(InetSocketAddress targetAddr) {
     InetAddress addr = targetAddr.getAddress();

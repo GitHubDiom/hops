@@ -9,6 +9,7 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.serverless.ServerlessNameNodeKeys;
 import org.apache.hadoop.hdfs.serverless.execution.futures.ServerlessHttpFuture;
+import org.apache.hadoop.util.StringUtils;
 import org.apache.http.HttpHeaders;
 import org.apache.http.client.methods.HttpPost;
 import org.apache.http.entity.StringEntity;
@@ -24,6 +25,7 @@ import java.util.*;
 
 import static com.google.common.hash.Hashing.consistentHash;
 import static org.apache.hadoop.hdfs.serverless.ServerlessNameNodeKeys.BATCH;
+import static org.apache.hadoop.hdfs.serverless.invoking.ServerlessUtilities.getFunctionNumberForFileOrDirectory;
 
 /**
  * The serverless platform being used is specified in the configuration files for Serverless HopsFS. Currently, it
@@ -67,7 +69,7 @@ public class OpenWhiskInvoker extends ServerlessInvokerBase {
      * Because invokers are generally created via the {@link ServerlessInvokerFactory} class, this constructor
      * will not be used directly.
      */
-    protected OpenWhiskInvoker() throws NoSuchAlgorithmException, KeyManagementException {
+    protected OpenWhiskInvoker() {
         super();
     }
 
@@ -77,39 +79,6 @@ public class OpenWhiskInvoker extends ServerlessInvokerBase {
 
         authorizationString = conf.get(DFSConfigKeys.SERVERLESS_OPENWHISK_AUTH,
                 DFSConfigKeys.SERVERLESS_OPENWHISK_AUTH_DEFAULT);
-    }
-
-    /**
-     * Redirect a received request to another NameNode. This is useful when a client issues a write request to
-     * a deployment that is not authorized to perform writes on the target file/directory.
-     *
-     * @param operationName The FS operation being performed. This is passed to the NameNode so that it knows which of
-     *                      its functions it should execute. This is sort of taking the place of the RPC mechanism,
-     *                      where ordinarily you'd just invoke an RPC method.
-     * @param nameNodeArguments Arguments for the Name Node itself. These would traditionally be passed as command line
-     *                          arguments when using a serverful name node. We generally don't need to pass anything
-     *                          for this parameter.
-     * @param fileSystemOperationArguments The parameters to the FS operation. Specifically, these are the arguments
-     *                                     to the Java function which performs the FS operation. The NameNode will
-     *                                     extract these after it sees what function it is supposed to execute. These
-     *                                     would traditionally just be passed as arguments to the RPC call, but we
-     *                                     aren't using RPC.
-     * @param requestId The unique ID used to match this request uniquely against its corresponding TCP request. If
-     *                  passed a null, then a random ID is generated.
-     * @param targetDeployment Specify the deployment to target. Use -1 to use the cache or a random deployment if no
-     *                         cache entry exists.
-     * @return The response from the Serverless NameNode.
-     */
-    @Override
-    public ServerlessHttpFuture redirectRequest(String operationName, JsonObject nameNodeArguments,
-                                                JsonObject fileSystemOperationArguments,
-                                                String requestId, int targetDeployment) throws IOException {
-        HttpPost request = new HttpPost(getFunctionUri(functionUriBase, targetDeployment, fileSystemOperationArguments));
-        request.setHeader(HttpHeaders.AUTHORIZATION, "Basic " + authorizationString);
-
-        // Just hand everything off to the internal HTTP invoke method.
-        return enqueueHttpRequestInt(operationName, nameNodeArguments,
-                fileSystemOperationArguments, requestId, targetDeployment);
     }
 
     /**
@@ -140,7 +109,7 @@ public class OpenWhiskInvoker extends ServerlessInvokerBase {
                 if (fileSystemOperationArguments != null && fileSystemOperationArguments.has(ServerlessNameNodeKeys.SRC)) {
                     String sourceFileOrDirectory =
                             fileSystemOperationArguments.getAsJsonPrimitive("src").getAsString();
-                    targetDeployment = getFunctionNumberForFileOrDirectory(sourceFileOrDirectory); // cache.getFunction(sourceFileOrDirectory);
+                    targetDeployment = getFunctionNumberForFileOrDirectory(sourceFileOrDirectory, numDeployments); // cache.getFunction(sourceFileOrDirectory);
                 } else {
                     if (LOG.isDebugEnabled()) LOG.debug("No `src` property found in file system arguments... " + "skipping the checking of INode cache...");
                 }
@@ -214,27 +183,29 @@ public class OpenWhiskInvoker extends ServerlessInvokerBase {
     }
 
     @Override
-    protected void sendOutgoingRequests() throws UnsupportedEncodingException, SocketException, UnknownHostException {
+    protected void sendEnqueuedRequests() throws UnsupportedEncodingException, SocketException, UnknownHostException {
         if (!hasBeenConfigured())
             throw new IllegalStateException("Serverless Invoker has not yet been configured! " +
                     "You must configure it by calling .setConfiguration(...) before using it.");
 
-        List<List<JsonObject>> batchedRequests = createRequestBatches();
+        List<List<JsonObject>> batchedRequests = new ArrayList<>();
+        int totalNumRequestsBatched = createRequestBatches(batchedRequests);
+
+        if (totalNumRequestsBatched == 0)
+            return;
 
         // We've created all the batches. Now we need to issue the requests.
+        int totalNumBatchedRequestsIssued = 0;
         for (int i = 0; i < numDeployments; i++) {
             List<JsonObject> deploymentBatches = batchedRequests.get(i);
 
             if (deploymentBatches.size() > 0) {
                 if (LOG.isDebugEnabled()) LOG.debug("Preparing to send " + deploymentBatches.size() +
-                        " batch(es) of requests for Deployment " + i);
+                        " batch(es) of requests to Deployment " + i);
 
                 for (JsonObject requestBatch : deploymentBatches) {
                     // This is the top-level JSON object passed along with the HTTP POST request.
                     JsonObject topLevel = new JsonObject();
-
-                    HttpPost request = new HttpPost(getFunctionUri(functionUriBase, i, topLevel));
-                    request.setHeader(HttpHeaders.AUTHORIZATION, "Basic " + authorizationString);
 
                     JsonObject nameNodeArguments = new JsonObject();
                     nameNodeArguments.add(BATCH, requestBatch);
@@ -244,19 +215,32 @@ public class OpenWhiskInvoker extends ServerlessInvokerBase {
                     // within the HTTP POST request. They should be included with the key "value".
                     topLevel.add(ServerlessNameNodeKeys.VALUE, nameNodeArguments);
 
+                    String requestUri = getFunctionUri(functionUriBase, i, topLevel);
+                    HttpPost request = new HttpPost(requestUri);
+                    request.setHeader(HttpHeaders.AUTHORIZATION, "Basic " + authorizationString);
+
                     // Prepare the HTTP POST request.
                     StringEntity parameters = new StringEntity(topLevel.toString());
                     request.setEntity(parameters);
                     request.setHeader(HttpHeaders.CONTENT_TYPE, "application/json");
 
                     try {
+                        if (LOG.isDebugEnabled()) {
+                            LOG.debug("Issuing batched HTTP request to deployment " + i +
+                                    " with URI = " + requestUri + ", requestIDs = " +
+                                    StringUtils.join(", ", requestBatch.keySet()));
+                        }
+
                         doInvoke(request, topLevel, requestBatch.keySet());
+                        totalNumBatchedRequestsIssued++;
                     } catch (IOException ex) {
                         LOG.error("Encountered IOException while issuing batched HTTP request:", ex);
                     }
                 }
             }
         }
+
+        if (LOG.isDebugEnabled()) LOG.debug("Issued a total of " + totalNumBatchedRequestsIssued + " batched HTTP request(s).");
     }
 
     /**

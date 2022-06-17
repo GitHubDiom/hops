@@ -1,7 +1,6 @@
 package org.apache.hadoop.hdfs.serverless.execution.futures;
 
 import com.google.gson.JsonObject;
-import org.apache.commons.lang3.NotImplementedException;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.hdfs.serverless.execution.results.NullResult;
@@ -61,10 +60,14 @@ public abstract class ServerlessFuture<T> implements Future<T> {
      */
     public abstract void cancel(String reason, boolean shouldRetry) throws InterruptedException;
 
-    @Override
-    public boolean cancel(boolean mayInterruptIfRunning) {
-        throw new NotImplementedException("Standard cancel API is not supported.");
-    }
+    /**
+     * Attempts to cancel execution of this task.
+     *
+     * @param mayInterruptIfRunning true if the thread executing this task should be interrupted; otherwise,
+     *                              in-progress tasks are allowed to complete
+     * @return false if the task could not be cancelled, often because it's already completed normally; true otherwise.
+     */
+    public abstract boolean cancel(boolean mayInterruptIfRunning);
 
     @Override
     public synchronized boolean isCancelled() {
@@ -78,9 +81,9 @@ public abstract class ServerlessFuture<T> implements Future<T> {
 
     @Override
     public T get() throws InterruptedException, ExecutionException {
-        if (LOG.isDebugEnabled()) LOG.debug("Waiting for result for TCP request " + requestId + " now...");
+        if (LOG.isDebugEnabled()) LOG.debug("Waiting for result for request " + requestId + " now...");
         final T resultOrNull = this.resultQueue.take();
-        if (LOG.isDebugEnabled()) LOG.debug("Got result for TCP future " + requestId + ".");
+        if (LOG.isDebugEnabled()) LOG.debug("Got result for future " + requestId + ".");
 
         // Check if the NullResult object was placed in the queue, in which case we should return null.
         if (resultOrNull instanceof NullResult)
